@@ -24,6 +24,7 @@ async def startup():
         dsn=os.environ["DATABASE_URL"],
         min_size=1,
         max_size=5,
+        ssl="require",
     )
 
 @app.on_event("shutdown")
