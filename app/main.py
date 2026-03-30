@@ -10,13 +10,8 @@ import asyncpg
 
 app = FastAPI(title="OMS Label Service")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# No CORS here — this service is behind the gateway which handles CORS
+# (wildcard + credentials=True is rejected by browsers anyway)
 
 @app.on_event("startup")
 async def startup():
