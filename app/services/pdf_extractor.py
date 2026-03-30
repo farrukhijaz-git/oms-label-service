@@ -1,6 +1,20 @@
 import re
 import pdfplumber
 import io
+from pypdf import PdfReader, PdfWriter
+
+
+def split_pdf_pages(pdf_bytes: bytes) -> list:
+    """Split a multi-page PDF into a list of single-page PDF bytes."""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    pages = []
+    for page in reader.pages:
+        writer = PdfWriter()
+        writer.add_page(page)
+        buf = io.BytesIO()
+        writer.write(buf)
+        pages.append(buf.getvalue())
+    return pages if pages else [pdf_bytes]
 
 STREET_SUFFIXES = {"st", "street", "ave", "avenue", "blvd", "boulevard", "dr", "drive",
                    "rd", "road", "ln", "lane", "ct", "court", "way", "pl", "place"}

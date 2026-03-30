@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from typing import List
 from app.middleware.auth import get_current_user, require_admin
-from app.services.pdf_extractor import extract_label_data
+from app.services.pdf_extractor import extract_label_data, split_pdf_pages
 from app.services.fuzzy_matcher import find_best_match
 from app.services.storage import upload_pdf, get_signed_url
 from datetime import datetime, timezone
@@ -45,56 +45,68 @@ async def upload_labels(request: Request, files: List[UploadFile] = File(...)):
         pdf_bytes = await file.read()
         filename = file.filename or "upload.pdf"
 
+        # Debatch: split multi-page PDFs into individual pages so each label
+        # gets its own storage record, extraction, and auto-match attempt.
         try:
-            # Upload to storage
-            storage_path = upload_pdf(pdf_bytes, filename)
-
-            # Extract text
-            extracted = extract_label_data(pdf_bytes)
-
-            if extracted["is_image_pdf"]:
-                match_result = {
-                    "matched_order_id": None,
-                    "confidence": 0.0,
-                    "match_status": "unmatched",
-                    "top_candidates": [],
-                }
-            else:
-                match_result = find_best_match(extracted, open_orders)
-
-            # Insert into database
-            row = await db.fetchrow(
-                """
-                INSERT INTO labels.shipping_labels
-                  (storage_path, original_filename, extracted_name, extracted_address,
-                   match_confidence, match_status, order_id, uploaded_by)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                RETURNING id, match_status, match_confidence, order_id
-                """,
-                storage_path,
-                filename,
-                extracted.get("customer_name"),
-                extracted.get("address"),
-                match_result["confidence"],
-                match_result["match_status"],
-                match_result.get("matched_order_id"),
-                user["user_id"],
-            )
-
-            results.append({
-                "filename": filename,
-                "label_id": str(row["id"]),
-                "extracted_name": extracted.get("customer_name"),
-                "extracted_address": extracted.get("address"),
-                "is_image_pdf": extracted["is_image_pdf"],
-                "match_status": row["match_status"],
-                "match_confidence": float(row["match_confidence"]) if row["match_confidence"] else 0.0,
-                "matched_order_id": str(row["order_id"]) if row["order_id"] else None,
-                "top_candidates": match_result.get("top_candidates", []),
-            })
+            pages = split_pdf_pages(pdf_bytes)
         except Exception as e:
-            print(f"Error processing {filename}: {e}")
-            results.append({"filename": filename, "error": str(e)})
+            print(f"PDF split failed for {filename}, treating as single page: {e}")
+            pages = [pdf_bytes]
+
+        for page_num, page_bytes in enumerate(pages):
+            # Use p1_, p2_… prefix only when there are multiple pages
+            page_filename = f"p{page_num + 1}_{filename}" if len(pages) > 1 else filename
+
+            try:
+                # Upload individual page to storage
+                storage_path = upload_pdf(page_bytes, page_filename)
+
+                # Extract text from this page
+                extracted = extract_label_data(page_bytes)
+
+                if extracted["is_image_pdf"]:
+                    match_result = {
+                        "matched_order_id": None,
+                        "confidence": 0.0,
+                        "match_status": "unmatched",
+                        "top_candidates": [],
+                    }
+                else:
+                    match_result = find_best_match(extracted, open_orders)
+
+                # Insert one row per page
+                row = await db.fetchrow(
+                    """
+                    INSERT INTO labels.shipping_labels
+                      (storage_path, original_filename, extracted_name, extracted_address,
+                       match_confidence, match_status, order_id, uploaded_by)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    RETURNING id, match_status, match_confidence, order_id
+                    """,
+                    storage_path,
+                    page_filename,
+                    extracted.get("customer_name"),
+                    extracted.get("address"),
+                    match_result["confidence"],
+                    match_result["match_status"],
+                    match_result.get("matched_order_id"),
+                    user["user_id"],
+                )
+
+                results.append({
+                    "filename": page_filename,
+                    "label_id": str(row["id"]),
+                    "extracted_name": extracted.get("customer_name"),
+                    "extracted_address": extracted.get("address"),
+                    "is_image_pdf": extracted["is_image_pdf"],
+                    "match_status": row["match_status"],
+                    "match_confidence": float(row["match_confidence"]) if row["match_confidence"] else 0.0,
+                    "matched_order_id": str(row["order_id"]) if row["order_id"] else None,
+                    "top_candidates": match_result.get("top_candidates", []),
+                })
+            except Exception as e:
+                print(f"Error processing {page_filename}: {e}")
+                results.append({"filename": page_filename, "error": str(e)})
 
     return {"results": results}
 
