@@ -1,7 +1,10 @@
 import re
 import pdfplumber
 import io
+import logging
 from pypdf import PdfReader, PdfWriter
+
+logger = logging.getLogger(__name__)
 
 
 def split_pdf_pages(pdf_bytes: bytes) -> list:
@@ -16,12 +19,30 @@ def split_pdf_pages(pdf_bytes: bytes) -> list:
         pages.append(buf.getvalue())
     return pages if pages else [pdf_bytes]
 
+
+def _ocr_pdf_page(pdf_bytes: bytes) -> str:
+    """OCR a single-page PDF using tesseract. Returns extracted text or empty string."""
+    try:
+        from pdf2image import convert_from_bytes
+        import pytesseract
+        images = convert_from_bytes(pdf_bytes, dpi=200)
+        if not images:
+            return ""
+        # Single-page PDF — just process the first image
+        text = pytesseract.image_to_string(images[0])
+        logger.info(f"OCR extracted {len(text)} chars")
+        return text
+    except Exception as e:
+        logger.warning(f"OCR failed: {e}")
+        return ""
+
 STREET_SUFFIXES = {"st", "street", "ave", "avenue", "blvd", "boulevard", "dr", "drive",
                    "rd", "road", "ln", "lane", "ct", "court", "way", "pl", "place"}
 COMPANY_KEYWORDS = {"llc", "inc", "corp", "ltd", "co", "company", "services", "group"}
 
 def extract_label_data(pdf_bytes: bytes) -> dict:
-    """Extract customer name and address from PDF bytes."""
+    """Extract customer name and address from PDF bytes.
+    Tries pdfplumber text extraction first; falls back to OCR for image-based PDFs."""
     result = {
         "customer_name": None,
         "address": None,
@@ -29,33 +50,35 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
         "raw_text": "",
     }
 
+    all_text = ""
+
+    # --- Step 1: pdfplumber text extraction ---
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            all_text = ""
             for page in pdf.pages:
                 text = page.extract_text()
                 if text:
                     all_text += text + "\n"
-
-            if not all_text.strip():
-                result["is_image_pdf"] = True
-                return result
-
-            result["raw_text"] = all_text
-
-            lines = [line.strip() for line in all_text.split("\n") if line.strip()]
-
-            # Try to find customer name: title case, 2-4 words, no street/company keywords
-            customer_name = _extract_name(lines)
-            result["customer_name"] = customer_name
-
-            # Try to find address: line with street number pattern
-            address = _extract_address(lines)
-            result["address"] = address
-
     except Exception as e:
-        print(f"PDF extraction error: {e}")
+        logger.warning(f"pdfplumber extraction error: {e}")
+
+    # --- Step 2: OCR fallback for image-based PDFs ---
+    if not all_text.strip():
         result["is_image_pdf"] = True
+        logger.info("No text from pdfplumber — attempting OCR")
+        all_text = _ocr_pdf_page(pdf_bytes)
+        if not all_text.strip():
+            logger.warning("OCR also returned no text")
+            return result
+        # OCR succeeded — clear the image flag since we now have text
+        result["is_image_pdf"] = False
+
+    result["raw_text"] = all_text
+    lines = [line.strip() for line in all_text.split("\n") if line.strip()]
+    logger.debug(f"Extracted lines: {lines[:20]}")
+
+    result["customer_name"] = _extract_name(lines)
+    result["address"] = _extract_address(lines)
 
     return result
 
