@@ -33,7 +33,7 @@ async def shutdown():
 
 app.include_router(labels.router, prefix="/labels")
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     from datetime import datetime, timezone
     return {"status": "ok", "service": "labels", "timestamp": datetime.now(timezone.utc).isoformat()}
