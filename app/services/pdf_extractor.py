@@ -28,7 +28,6 @@ def _ocr_pdf_page(pdf_bytes: bytes) -> str:
         images = convert_from_bytes(pdf_bytes, dpi=200)
         if not images:
             return ""
-        # Single-page PDF — just process the first image
         text = pytesseract.image_to_string(images[0])
         logger.info(f"OCR extracted {len(text)} chars")
         return text
@@ -36,73 +35,169 @@ def _ocr_pdf_page(pdf_bytes: bytes) -> str:
         logger.warning(f"OCR failed: {e}")
         return ""
 
-STREET_SUFFIXES = {"st", "street", "ave", "avenue", "blvd", "boulevard", "dr", "drive",
-                   "rd", "road", "ln", "lane", "ct", "court", "way", "pl", "place"}
+
+# ── Keyword sets for name extraction fallback ──────────────────────────────────
+
+STREET_SUFFIXES = {
+    "st", "street", "ave", "avenue", "blvd", "boulevard", "dr", "drive",
+    "rd", "road", "ln", "lane", "ct", "court", "way", "pl", "place",
+    "ter", "terrace", "cir", "circle", "pkwy", "parkway", "hwy", "highway",
+}
 COMPANY_KEYWORDS = {"llc", "inc", "corp", "ltd", "co", "company", "services", "group"}
 
-def extract_label_data(pdf_bytes: bytes) -> dict:
-    """Extract customer name and address from PDF bytes.
-    Tries pdfplumber text extraction first; falls back to OCR for image-based PDFs."""
-    result = {
-        "customer_name": None,
-        "address": None,
-        "is_image_pdf": False,
-        "raw_text": "",
-    }
+# Lines containing any of these are definitely NOT a recipient name
+CARRIER_KEYWORDS = {
+    "usps", "ups", "fedex", "dhl", "stamps", "postage", "tracking",
+    "priority", "ground", "express", "advantage", "delivery", "shipping",
+    "trademark", "mailed", "barcode", "e-postage", "first", "class",
+    "media", "parcel", "retail", "commercial", "presorted", "certified",
+}
 
-    all_text = ""
+# ── "SHIP TO" anchored extraction ─────────────────────────────────────────────
 
-    # --- Step 1: pdfplumber text extraction ---
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    all_text += text + "\n"
-    except Exception as e:
-        logger.warning(f"pdfplumber extraction error: {e}")
+# Matches: "SHIP TO: Name", "SHIP TO:", "SHIP Name" (USPS two-column format),
+#          "DELIVER TO:", "TO:" (when it appears after SHIP on prior line)
+_SHIP_TO_RE   = re.compile(r"^SHIP\s+TO:?\s*(.*)", re.IGNORECASE)
+_SHIP_NAME_RE = re.compile(r"^SHIP\s+(?!TO)(.+)", re.IGNORECASE)
+_TO_RE        = re.compile(r"^TO:\s*(.*)", re.IGNORECASE)
+_DELIVER_RE   = re.compile(r"^DELIVER\s+TO:?\s*(.*)", re.IGNORECASE)
+# City/state/zip — comma optional (CAPE CORAL FL 33909 or CAPE CORAL, FL 33909)
+_CITY_STATE_ZIP_RE = re.compile(r"[A-Za-z][A-Za-z\s]+,?\s+[A-Z]{2}\s+\d{5}", re.IGNORECASE)
 
-    # --- Step 2: OCR fallback for image-based PDFs ---
-    if not all_text.strip():
-        result["is_image_pdf"] = True
-        logger.info("No text from pdfplumber — attempting OCR")
-        all_text = _ocr_pdf_page(pdf_bytes)
-        if not all_text.strip():
-            logger.warning("OCR also returned no text")
-            return result
-        # OCR succeeded — clear the image flag since we now have text
-        result["is_image_pdf"] = False
 
-    result["raw_text"] = all_text
-    lines = [line.strip() for line in all_text.split("\n") if line.strip()]
-    logger.debug(f"Extracted lines: {lines[:20]}")
+def _extract_ship_to(lines: list) -> tuple:
+    """
+    Anchor on SHIP TO / DELIVER TO keywords to extract recipient name + address.
 
-    result["customer_name"] = _extract_name(lines)
-    result["address"] = _extract_address(lines)
+    Handles three common label formats:
+      A) "SHIP TO: Firstname Lastname" then address lines (single combined line)
+      B) "SHIP TO:"  (empty) then name on next line then address (multi-line)
+      C) "SHIP  Firstname Lastname" / "TO:  123 Main St" (USPS two-column format)
 
-    return result
+    Returns (name, address) or (None, None) if no shipping section found.
+    """
+    for i, line in enumerate(lines):
 
+        # ── Format A & B: "SHIP TO:" ──────────────────────────────────────────
+        m = _SHIP_TO_RE.match(line)
+        if m:
+            remainder = m.group(1).strip()
+            if remainder and not _looks_like_address(remainder):
+                # Format A: name on same line
+                name = remainder
+                addr_start = i + 1
+            else:
+                # Format B: name on next line
+                if i + 1 >= len(lines):
+                    return None, None
+                name = lines[i + 1].strip()
+                addr_start = i + 2
+
+            address = _collect_address(lines, addr_start)
+            return _clean_name(name), address
+
+        # ── Format C: "SHIP  Antonia Pantoja Vidal" (USPS two-column) ────────
+        m = _SHIP_NAME_RE.match(line)
+        if m:
+            name = m.group(1).strip()
+            # Next line should be "TO: <address>" or just the address
+            if i + 1 < len(lines):
+                to_m = _TO_RE.match(lines[i + 1])
+                if to_m:
+                    addr_line1 = to_m.group(1).strip()
+                    addr_line2 = lines[i + 2].strip() if i + 2 < len(lines) else ""
+                else:
+                    addr_line1 = lines[i + 1].strip()
+                    addr_line2 = lines[i + 2].strip() if i + 2 < len(lines) else ""
+
+                address = _build_address(addr_line1, addr_line2)
+                return _clean_name(name), address
+
+        # ── DELIVER TO ────────────────────────────────────────────────────────
+        m = _DELIVER_RE.match(line)
+        if m:
+            remainder = m.group(1).strip()
+            if remainder and not _looks_like_address(remainder):
+                name = remainder
+                addr_start = i + 1
+            else:
+                if i + 1 >= len(lines):
+                    return None, None
+                name = lines[i + 1].strip()
+                addr_start = i + 2
+
+            address = _collect_address(lines, addr_start)
+            return _clean_name(name), address
+
+    return None, None
+
+
+def _looks_like_address(text: str) -> bool:
+    """Return True if text starts with a house number."""
+    return bool(re.match(r"^\d+\s", text))
+
+
+def _collect_address(lines: list, start: int) -> str | None:
+    """Pull address_line1 + city/state/zip starting at lines[start]."""
+    if start >= len(lines):
+        return None
+    addr_line1 = lines[start].strip()
+    addr_line2 = lines[start + 1].strip() if start + 1 < len(lines) else ""
+    return _build_address(addr_line1, addr_line2)
+
+
+def _build_address(line1: str, line2: str) -> str | None:
+    """Combine street line + city/state/zip into a single address string."""
+    parts = []
+    if line1 and re.match(r"^\d+", line1):
+        parts.append(line1)
+    # line2 might be city/state/zip
+    if line2 and (_CITY_STATE_ZIP_RE.search(line2) or re.match(r"^\d+", line2)):
+        parts.append(line2)
+    return ", ".join(parts).upper() if parts else (line1.upper() if line1 else None)
+
+
+def _clean_name(name: str) -> str | None:
+    """Strip any leading 'TO:' artifact and return None if clearly not a name."""
+    if not name:
+        return None
+    name = re.sub(r"^TO:\s*", "", name, flags=re.IGNORECASE).strip()
+    # Reject if it looks like a tracking number, barcode, or service line
+    if re.match(r"^[\d\s\-]+$", name):
+        return None
+    lower_words = {w.lower().rstrip(".,") for w in name.split()}
+    if lower_words & CARRIER_KEYWORDS:
+        return None
+    return name or None
+
+
+# ── Generic fallback extraction ───────────────────────────────────────────────
 
 def _extract_name(lines: list) -> str | None:
-    """Find customer name from text lines."""
-    name_pattern = re.compile(r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})$")
-
+    """
+    Fallback name extraction used only when no SHIP TO section is found.
+    Skips carrier/service keyword lines and address-like lines.
+    """
     for line in lines:
-        # Skip lines with numbers (likely addresses)
         if re.search(r"\d", line):
             continue
 
         words = line.split()
-        if not 2 <= len(words) <= 4:
+        if not 2 <= len(words) <= 5:
             continue
 
-        # Check it looks like a name (title case words)
         if not all(w[0].isupper() for w in words if w):
             continue
 
-        # Skip if contains street/company keywords
         lower_words = {w.lower().rstrip(".,") for w in words}
-        if lower_words & STREET_SUFFIXES or lower_words & COMPANY_KEYWORDS:
+        if lower_words & STREET_SUFFIXES:
+            continue
+        if lower_words & COMPANY_KEYWORDS:
+            continue
+        if lower_words & CARRIER_KEYWORDS:
+            continue
+        # Skip all-caps single-word repeated patterns (barcodes, service names)
+        if all(w.isupper() for w in words):
             continue
 
         return line
@@ -111,16 +206,19 @@ def _extract_name(lines: list) -> str | None:
 
 
 def _extract_address(lines: list) -> str | None:
-    """Find address from text lines."""
-    # Pattern: starts with number, has street type
+    """Fallback address extraction."""
     street_pattern = re.compile(r"^\d+\s+\w+", re.IGNORECASE)
-    # Pattern for city, state, zip line
-    city_state_zip = re.compile(r"[A-Za-z\s]+,\s*[A-Z]{2}\s+\d{5}", re.IGNORECASE)
+    # Comma optional: "CAPE CORAL FL 33909" or "Cape Coral, FL 33909"
+    city_state_zip = re.compile(r"[A-Za-z][A-Za-z\s]+,?\s+[A-Z]{2}\s+\d{5}", re.IGNORECASE)
 
     street_line = None
     city_line = None
 
-    for i, line in enumerate(lines):
+    for line in lines:
+        # Skip lines that mention carrier/service names
+        lower_words = {w.lower().rstrip(".,") for w in line.split()}
+        if lower_words & CARRIER_KEYWORDS:
+            continue
         if street_pattern.match(line) and not street_line:
             street_line = line
         if city_state_zip.search(line) and not city_line:
@@ -134,15 +232,79 @@ def _extract_address(lines: list) -> str | None:
     return None
 
 
+# ── Main entry point ──────────────────────────────────────────────────────────
+
+def extract_label_data(pdf_bytes: bytes) -> dict:
+    """
+    Extract customer name and address from a single-page PDF.
+
+    Strategy:
+      1. pdfplumber text extraction
+      2. OCR fallback for image-based PDFs
+      3. SHIP TO / DELIVER TO anchored extraction (covers USPS, UPS, FedEx)
+      4. Generic heuristic fallback if no shipping section found
+    """
+    result = {
+        "customer_name": None,
+        "address": None,
+        "is_image_pdf": False,
+        "raw_text": "",
+    }
+
+    all_text = ""
+
+    # Step 1: pdfplumber
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    all_text += text + "\n"
+    except Exception as e:
+        logger.warning(f"pdfplumber extraction error: {e}")
+
+    # Step 2: OCR fallback
+    if not all_text.strip():
+        result["is_image_pdf"] = True
+        logger.info("No text from pdfplumber — attempting OCR")
+        all_text = _ocr_pdf_page(pdf_bytes)
+        if not all_text.strip():
+            logger.warning("OCR also returned no text")
+            return result
+        result["is_image_pdf"] = False
+
+    result["raw_text"] = all_text
+    lines = [line.strip() for line in all_text.split("\n") if line.strip()]
+    logger.info(f"Extracted {len(lines)} lines from PDF")
+    logger.debug(f"Lines: {lines[:30]}")
+
+    # Step 3: anchored SHIP TO extraction
+    name, address = _extract_ship_to(lines)
+
+    if name or address:
+        logger.info(f"Anchored extraction → name={name!r}, address={address!r}")
+        result["customer_name"] = name
+        result["address"] = address
+    else:
+        # Step 4: generic heuristics
+        logger.info("No SHIP TO section found — using generic heuristics")
+        result["customer_name"] = _extract_name(lines)
+        result["address"] = _extract_address(lines)
+
+    return result
+
+
 def normalize_text(text: str | None) -> str:
-    """Normalize text for comparison."""
+    """Normalize text for fuzzy comparison."""
     if not text:
         return ""
-    # Uppercase, strip extra whitespace, expand common abbreviations
     text = text.upper().strip()
     text = re.sub(r"\s+", " ", text)
-    abbrevs = {"ST ": "STREET ", "AVE ": "AVENUE ", "BLVD ": "BOULEVARD ",
-               "DR ": "DRIVE ", "RD ": "ROAD ", "LN ": "LANE "}
+    abbrevs = {
+        "ST ": "STREET ", "AVE ": "AVENUE ", "BLVD ": "BOULEVARD ",
+        "DR ": "DRIVE ", "RD ": "ROAD ", "LN ": "LANE ",
+        "TER ": "TERRACE ", "CIR ": "CIRCLE ", "CT ": "COURT ",
+    }
     for abbr, full in abbrevs.items():
         text = text.replace(abbr, full)
     return text
