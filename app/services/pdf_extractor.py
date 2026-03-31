@@ -210,6 +210,23 @@ def _extract_name(lines: list) -> str | None:
     return None
 
 
+def _extract_tracking_number(lines: list) -> str | None:
+    """Extract the first recognisable carrier tracking number from the label text."""
+    for line in lines:
+        # USPS — try the most-specific pattern first to avoid false-positives
+        m = _USPS_TRACKING_RE.search(line)
+        if m:
+            return m.group(1)
+        m = _UPS_TRACKING_RE.search(line)
+        if m:
+            return m.group(1)
+        # FedEx last — its generic digit patterns overlap with USPS barcodes
+        m = _FEDEX_TRACKING_RE.search(line)
+        if m:
+            return m.group(1)
+    return None
+
+
 def _extract_address(lines: list) -> str | None:
     """Fallback address extraction."""
     street_pattern = re.compile(r"^\d+\s+\w+", re.IGNORECASE)
