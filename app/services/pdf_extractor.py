@@ -64,6 +64,11 @@ _DELIVER_RE   = re.compile(r"^DELIVER\s+TO:?\s*(.*)", re.IGNORECASE)
 # City/state/zip — comma optional (CAPE CORAL FL 33909 or CAPE CORAL, FL 33909)
 _CITY_STATE_ZIP_RE = re.compile(r"[A-Za-z][A-Za-z\s]+,?\s+[A-Z]{2}\s+\d{5}", re.IGNORECASE)
 
+# Tracking number patterns for common carriers
+_USPS_TRACKING_RE = re.compile(r"\b(9[0-9]{21,34}|[A-Z]{2}[0-9]{9}US|420[0-9]{5}[A-Z]{2}[0-9]{24})\b")
+_UPS_TRACKING_RE = re.compile(r"\b(1Z[A-Z0-9]{16})\b")
+_FEDEX_TRACKING_RE = re.compile(r"\b([0-9]{12}|[0-9]{15}|[0-9]{20})\b")
+
 
 def _extract_ship_to(lines: list) -> tuple:
     """
@@ -236,17 +241,19 @@ def _extract_address(lines: list) -> str | None:
 
 def extract_label_data(pdf_bytes: bytes) -> dict:
     """
-    Extract customer name and address from a single-page PDF.
+    Extract customer name, address, and tracking number from a single-page PDF.
 
     Strategy:
       1. pdfplumber text extraction
       2. OCR fallback for image-based PDFs
       3. SHIP TO / DELIVER TO anchored extraction (covers USPS, UPS, FedEx)
       4. Generic heuristic fallback if no shipping section found
+      5. Tracking number extraction
     """
     result = {
         "customer_name": None,
         "address": None,
+        "tracking_number": None,
         "is_image_pdf": False,
         "raw_text": "",
     }
@@ -290,6 +297,11 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
         logger.info("No SHIP TO section found — using generic heuristics")
         result["customer_name"] = _extract_name(lines)
         result["address"] = _extract_address(lines)
+
+    # Step 5: extract tracking number
+    result["tracking_number"] = _extract_tracking_number(lines)
+    if result["tracking_number"]:
+        logger.info(f"Extracted tracking number: {result['tracking_number']}")
 
     return result
 

@@ -79,14 +79,15 @@ async def upload_labels(request: Request, files: List[UploadFile] = File(...)):
                     """
                     INSERT INTO labels.shipping_labels
                       (storage_path, original_filename, extracted_name, extracted_address,
-                       match_confidence, match_status, order_id, uploaded_by)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                       tracking_number, match_confidence, match_status, order_id, uploaded_by)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                     RETURNING id, match_status, match_confidence, order_id
                     """,
                     storage_path,
                     page_filename,
                     extracted.get("customer_name"),
                     extracted.get("address"),
+                    extracted.get("tracking_number"),
                     match_result["confidence"],
                     match_result["match_status"],
                     match_result.get("matched_order_id"),
@@ -98,6 +99,7 @@ async def upload_labels(request: Request, files: List[UploadFile] = File(...)):
                     "label_id": str(row["id"]),
                     "extracted_name": extracted.get("customer_name"),
                     "extracted_address": extracted.get("address"),
+                    "tracking_number": extracted.get("tracking_number"),
                     "is_image_pdf": extracted["is_image_pdf"],
                     "match_status": row["match_status"],
                     "match_confidence": float(row["match_confidence"]) if row["match_confidence"] else 0.0,
@@ -120,7 +122,7 @@ async def get_queue(request: Request):
     rows = await db.fetch(
         """
         SELECT l.id, l.original_filename, l.extracted_name, l.extracted_address,
-               l.match_confidence, l.match_status, l.order_id, l.uploaded_at,
+               l.tracking_number, l.match_confidence, l.match_status, l.order_id, l.uploaded_at,
                o.customer_name as matched_customer_name, o.external_id as matched_order_external_id
         FROM labels.shipping_labels l
         LEFT JOIN orders.orders o ON l.order_id = o.id
@@ -141,7 +143,7 @@ async def get_unmatched(request: Request):
     rows = await db.fetch(
         """
         SELECT id, original_filename, extracted_name, extracted_address,
-               match_confidence, match_status, order_id, uploaded_at
+               tracking_number, match_confidence, match_status, order_id, uploaded_at
         FROM labels.shipping_labels
         WHERE match_status = 'unmatched'
         ORDER BY uploaded_at DESC
@@ -172,7 +174,7 @@ async def confirm_label(label_id: str, request: Request):
             SET match_status = 'confirmed', order_id = $1,
                 confirmed_by = $2, confirmed_at = now()
             WHERE id = $3
-            RETURNING id, storage_path
+            RETURNING id, storage_path, tracking_number
             """,
             order_id, user["user_id"], label_id,
         )
@@ -180,15 +182,21 @@ async def confirm_label(label_id: str, request: Request):
         if not label:
             raise HTTPException(status_code=404, detail="Label not found")
 
-        # Update order: set label_id and status to label_generated
-        await db.execute(
-            "UPDATE orders.orders SET label_id = $1 WHERE id = $2",
-            label_id, order_id,
-        )
-
-    # Call orders service to update status (outside transaction, best-effort)
+    # Update order with label_id and tracking_number, then set status to label_generated
     try:
         async with httpx.AsyncClient() as client:
+            # First update the order with label_id and tracking_number
+            update_data = {"label_id": label_id}
+            if label["tracking_number"]:
+                update_data["tracking_number"] = label["tracking_number"]
+            
+            await client.patch(
+                f"{orders_service_url}/orders/{order_id}",
+                json=update_data,
+                headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
+                timeout=10.0
+            )
+            # Then update status
             await client.patch(
                 f"{orders_service_url}/orders/{order_id}/status",
                 json={"status": "label_generated", "note": "Label confirmed"},
@@ -196,7 +204,7 @@ async def confirm_label(label_id: str, request: Request):
                 timeout=10.0
             )
     except Exception as e:
-        print(f"Failed to update order status: {e}")
+        print(f"Failed to update order: {e}")
 
     return {"ok": True, "label_id": label_id, "order_id": order_id}
 
@@ -206,6 +214,8 @@ async def confirm_label(label_id: str, request: Request):
 async def assign_label(label_id: str, request: Request):
     user = get_current_user(request)
     db = request.app.state.db
+    orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3002")
+    
     body = await request.json()
     order_id = body.get("order_id")
 
@@ -218,7 +228,7 @@ async def assign_label(label_id: str, request: Request):
         SET match_status = 'manually_assigned', order_id = $1,
             confirmed_by = $2, confirmed_at = now()
         WHERE id = $3
-        RETURNING id
+        RETURNING id, tracking_number
         """,
         order_id, user["user_id"], label_id,
     )
@@ -226,11 +236,21 @@ async def assign_label(label_id: str, request: Request):
     if not label:
         raise HTTPException(status_code=404, detail="Label not found")
 
-    # Update order label_id
-    await db.execute(
-        "UPDATE orders.orders SET label_id = $1 WHERE id = $2",
-        label_id, order_id,
-    )
+    # Update order with label_id and tracking_number
+    try:
+        async with httpx.AsyncClient() as client:
+            update_data = {"label_id": label_id}
+            if label["tracking_number"]:
+                update_data["tracking_number"] = label["tracking_number"]
+            
+            await client.patch(
+                f"{orders_service_url}/orders/{order_id}",
+                json=update_data,
+                headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
+                timeout=10.0
+            )
+    except Exception as e:
+        print(f"Failed to update order with label_id: {e}")
 
     return {"ok": True, "label_id": label_id, "order_id": order_id}
 
