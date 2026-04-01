@@ -1,6 +1,8 @@
 import os
+import uuid
+import asyncio
 import httpx
-from fastapi import APIRouter, Request, UploadFile, File, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Request, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from typing import List
 from app.middleware.auth import get_current_user, require_admin
@@ -10,6 +12,7 @@ from app.services.storage import upload_pdf, get_signed_url
 from datetime import datetime, timezone
 
 router = APIRouter()
+
 
 async def get_open_orders(orders_service_url: str, user_id: str) -> list:
     """Fetch open orders from the orders service for matching."""
@@ -29,104 +32,189 @@ async def get_open_orders(orders_service_url: str, user_id: str) -> list:
     return []
 
 
-# POST /labels/upload
+# ---------------------------------------------------------------------------
+# Background processing helper
+# ---------------------------------------------------------------------------
+
+async def _process_upload_job(
+    job_id: str,
+    files_data: list,       # list of (filename: str, pdf_bytes: bytes)
+    user_id: str,
+    db_pool,                # asyncpg pool
+    orders_service_url: str,
+    jobs_store: dict,       # reference to app.state.upload_jobs
+):
+    """Run in background: OCR, extract, match, insert — one page at a time."""
+    job = jobs_store[job_id]
+    try:
+        # Fetch open orders once for all files (happens in background)
+        open_orders = await get_open_orders(orders_service_url, user_id)
+
+        results = []
+        file_index = 0
+
+        for filename, pdf_bytes in files_data:
+            file_index += 1
+            job["current_file"] = filename
+            job["current"] = file_index
+
+            # Split pages (CPU-bound → run in thread)
+            try:
+                pages = await asyncio.to_thread(split_pdf_pages, pdf_bytes)
+            except Exception as e:
+                print(f"PDF split failed for {filename}: {e}")
+                pages = [pdf_bytes]
+
+            for page_num, page_bytes in enumerate(pages):
+                page_filename = f"p{page_num + 1}_{filename}" if len(pages) > 1 else filename
+
+                try:
+                    # Upload to storage (network IO — run in thread for supabase SDK)
+                    storage_path = await asyncio.to_thread(upload_pdf, page_bytes, page_filename)
+
+                    # Extract text / OCR (CPU-bound)
+                    extracted = await asyncio.to_thread(extract_label_data, page_bytes)
+
+                    if extracted["is_image_pdf"]:
+                        match_result = {
+                            "matched_order_id": None,
+                            "confidence": 0.0,
+                            "match_status": "unmatched",
+                            "top_candidates": [],
+                        }
+                    else:
+                        match_result = find_best_match(extracted, open_orders)
+
+                    row = await db_pool.fetchrow(
+                        """
+                        INSERT INTO labels.shipping_labels
+                          (storage_path, original_filename, extracted_name, extracted_address,
+                           tracking_number, match_confidence, match_status, order_id, uploaded_by)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        RETURNING id, match_status, match_confidence, order_id
+                        """,
+                        storage_path,
+                        page_filename,
+                        extracted.get("customer_name"),
+                        extracted.get("address"),
+                        extracted.get("tracking_number"),
+                        match_result["confidence"],
+                        match_result["match_status"],
+                        match_result.get("matched_order_id"),
+                        user_id,
+                    )
+
+                    results.append({
+                        "filename": page_filename,
+                        "label_id": str(row["id"]),
+                        "extracted_name": extracted.get("customer_name"),
+                        "extracted_address": extracted.get("address"),
+                        "tracking_number": extracted.get("tracking_number"),
+                        "is_image_pdf": extracted["is_image_pdf"],
+                        "match_status": row["match_status"],
+                        "match_confidence": float(row["match_confidence"]) if row["match_confidence"] else 0.0,
+                        "matched_order_id": str(row["order_id"]) if row["order_id"] else None,
+                        "top_candidates": match_result.get("top_candidates", []),
+                        "tracking_conflict_order_id": match_result.get("tracking_match_order_id"),
+                    })
+                except Exception as e:
+                    print(f"Error processing {page_filename}: {e}")
+                    results.append({"filename": page_filename, "error": str(e)})
+
+        job["status"] = "done"
+        job["results"] = results
+
+    except Exception as e:
+        print(f"Upload job {job_id} failed: {e}")
+        job["status"] = "error"
+        job["error"] = str(e)
+
+
+# ---------------------------------------------------------------------------
+# POST /labels/upload — kick off background job, return job_id immediately
+# ---------------------------------------------------------------------------
 @router.post("/upload")
-async def upload_labels(request: Request, files: List[UploadFile] = File(...)):
+async def upload_labels(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+):
     user = get_current_user(request)
     db = request.app.state.db
+    jobs_store = request.app.state.upload_jobs
     orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3002")
 
-    # Fetch open orders once for all files
-    open_orders = await get_open_orders(orders_service_url, user["user_id"])
-
-    results = []
-
+    # Read all file bytes NOW (before request connection closes)
+    files_data = []
     for file in files:
         pdf_bytes = await file.read()
-        filename = file.filename or "upload.pdf"
+        files_data.append((file.filename or "upload.pdf", pdf_bytes))
 
-        # Debatch: split multi-page PDFs into individual pages so each label
-        # gets its own storage record, extraction, and auto-match attempt.
-        try:
-            pages = split_pdf_pages(pdf_bytes)
-        except Exception as e:
-            print(f"PDF split failed for {filename}, treating as single page: {e}")
-            pages = [pdf_bytes]
+    job_id = str(uuid.uuid4())
+    jobs_store[job_id] = {
+        "status": "processing",
+        "current": 0,
+        "total": len(files_data),
+        "current_file": None,
+        "results": None,
+        "error": None,
+    }
 
-        for page_num, page_bytes in enumerate(pages):
-            # Use p1_, p2_… prefix only when there are multiple pages
-            page_filename = f"p{page_num + 1}_{filename}" if len(pages) > 1 else filename
+    background_tasks.add_task(
+        _process_upload_job,
+        job_id,
+        files_data,
+        user["user_id"],
+        db,
+        orders_service_url,
+        jobs_store,
+    )
 
-            try:
-                # Upload individual page to storage
-                storage_path = upload_pdf(page_bytes, page_filename)
-
-                # Extract text from this page
-                extracted = extract_label_data(page_bytes)
-
-                if extracted["is_image_pdf"]:
-                    match_result = {
-                        "matched_order_id": None,
-                        "confidence": 0.0,
-                        "match_status": "unmatched",
-                        "top_candidates": [],
-                    }
-                else:
-                    match_result = find_best_match(extracted, open_orders)
-
-                # Insert one row per page
-                row = await db.fetchrow(
-                    """
-                    INSERT INTO labels.shipping_labels
-                      (storage_path, original_filename, extracted_name, extracted_address,
-                       tracking_number, match_confidence, match_status, order_id, uploaded_by)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                    RETURNING id, match_status, match_confidence, order_id
-                    """,
-                    storage_path,
-                    page_filename,
-                    extracted.get("customer_name"),
-                    extracted.get("address"),
-                    extracted.get("tracking_number"),
-                    match_result["confidence"],
-                    match_result["match_status"],
-                    match_result.get("matched_order_id"),
-                    user["user_id"],
-                )
-
-                results.append({
-                    "filename": page_filename,
-                    "label_id": str(row["id"]),
-                    "extracted_name": extracted.get("customer_name"),
-                    "extracted_address": extracted.get("address"),
-                    "tracking_number": extracted.get("tracking_number"),
-                    "is_image_pdf": extracted["is_image_pdf"],
-                    "match_status": row["match_status"],
-                    "match_confidence": float(row["match_confidence"]) if row["match_confidence"] else 0.0,
-                    "matched_order_id": str(row["order_id"]) if row["order_id"] else None,
-                    "top_candidates": match_result.get("top_candidates", []),
-                })
-            except Exception as e:
-                print(f"Error processing {page_filename}: {e}")
-                results.append({"filename": page_filename, "error": str(e)})
-
-    return {"results": results}
+    return {
+        "job_id": job_id,
+        "status": "processing",
+        "total_files": len(files_data),
+    }
 
 
-# GET /labels/queue - pending labels
+# ---------------------------------------------------------------------------
+# GET /labels/jobs/{job_id} — poll upload job progress
+# ---------------------------------------------------------------------------
+@router.get("/jobs/{job_id}")
+async def get_upload_job(job_id: str, request: Request):
+    get_current_user(request)  # auth check
+    jobs_store = request.app.state.upload_jobs
+    job = jobs_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+# ---------------------------------------------------------------------------
+# GET /labels/queue - pending labels (with matched order address details)
+# ---------------------------------------------------------------------------
 @router.get("/queue")
 async def get_queue(request: Request):
-    user = get_current_user(request)
+    get_current_user(request)
     db = request.app.state.db
 
     rows = await db.fetch(
         """
-        SELECT l.id, l.original_filename, l.extracted_name, l.extracted_address,
-               l.tracking_number, l.match_confidence, l.match_status, l.order_id, l.uploaded_at,
-               o.customer_name as matched_customer_name, o.external_id as matched_order_external_id
+        SELECT
+          l.id, l.original_filename, l.extracted_name, l.extracted_address,
+          l.tracking_number, l.match_confidence, l.match_status, l.order_id, l.uploaded_at,
+          o.customer_name   AS matched_customer_name,
+          o.external_id     AS matched_order_external_id,
+          o.address_line1   AS matched_address_line1,
+          o.address_line2   AS matched_address_line2,
+          o.city            AS matched_city,
+          o.state           AS matched_state,
+          o.zip             AS matched_zip,
+          o.status          AS matched_order_status,
+          o.tracking_number AS order_tracking_number
         FROM labels.shipping_labels l
         LEFT JOIN orders.orders o ON l.order_id = o.id
-        WHERE l.match_status = 'pending'
+        WHERE l.match_status IN ('pending', 'tracking_conflict')
         ORDER BY l.uploaded_at DESC
         """,
     )
@@ -134,10 +222,12 @@ async def get_queue(request: Request):
     return {"labels": [dict(r) for r in rows]}
 
 
+# ---------------------------------------------------------------------------
 # GET /labels/unmatched - unmatched labels
+# ---------------------------------------------------------------------------
 @router.get("/unmatched")
 async def get_unmatched(request: Request):
-    user = get_current_user(request)
+    get_current_user(request)
     db = request.app.state.db
 
     rows = await db.fetch(
@@ -153,7 +243,9 @@ async def get_unmatched(request: Request):
     return {"labels": [dict(r) for r in rows]}
 
 
+# ---------------------------------------------------------------------------
 # POST /labels/{label_id}/confirm
+# ---------------------------------------------------------------------------
 @router.post("/{label_id}/confirm")
 async def confirm_label(label_id: str, request: Request):
     user = get_current_user(request)
@@ -167,7 +259,6 @@ async def confirm_label(label_id: str, request: Request):
     orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3002")
 
     async with db.transaction():
-        # Update label
         label = await db.fetchrow(
             """
             UPDATE labels.shipping_labels
@@ -182,26 +273,39 @@ async def confirm_label(label_id: str, request: Request):
         if not label:
             raise HTTPException(status_code=404, detail="Label not found")
 
-    # Update order with label_id and tracking_number, then set status to label_generated
+    # Fetch the order to see if it already has a tracking number
+    existing_order_tracking = None
     try:
         async with httpx.AsyncClient() as client:
-            # First update the order with label_id and tracking_number
+            order_resp = await client.get(
+                f"{orders_service_url}/orders/{order_id}",
+                headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
+                timeout=10.0,
+            )
+            if order_resp.status_code == 200:
+                existing_order_tracking = order_resp.json().get("order", {}).get("tracking_number")
+    except Exception as e:
+        print(f"Could not fetch order to check tracking: {e}")
+
+    # Update order: always set label_id; only set tracking if order doesn't already have one
+    try:
+        async with httpx.AsyncClient() as client:
             update_data = {"label_id": label_id}
-            if label["tracking_number"]:
+            if label["tracking_number"] and not existing_order_tracking:
                 update_data["tracking_number"] = label["tracking_number"]
-            
+
             await client.patch(
                 f"{orders_service_url}/orders/{order_id}",
                 json=update_data,
                 headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
-                timeout=10.0
+                timeout=10.0,
             )
-            # Then update status
+
             await client.patch(
                 f"{orders_service_url}/orders/{order_id}/status",
                 json={"status": "label_generated", "note": "Label confirmed"},
                 headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
-                timeout=10.0
+                timeout=10.0,
             )
     except Exception as e:
         print(f"Failed to update order: {e}")
@@ -209,13 +313,15 @@ async def confirm_label(label_id: str, request: Request):
     return {"ok": True, "label_id": label_id, "order_id": order_id}
 
 
+# ---------------------------------------------------------------------------
 # PATCH /labels/{label_id}/assign - manually assign label to order
+# ---------------------------------------------------------------------------
 @router.patch("/{label_id}/assign")
 async def assign_label(label_id: str, request: Request):
     user = get_current_user(request)
     db = request.app.state.db
     orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3002")
-    
+
     body = await request.json()
     order_id = body.get("order_id")
 
@@ -236,18 +342,31 @@ async def assign_label(label_id: str, request: Request):
     if not label:
         raise HTTPException(status_code=404, detail="Label not found")
 
-    # Update order with label_id and tracking_number
+    # Fetch order's existing tracking before deciding whether to update it
+    existing_order_tracking = None
+    try:
+        async with httpx.AsyncClient() as client:
+            order_resp = await client.get(
+                f"{orders_service_url}/orders/{order_id}",
+                headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
+                timeout=10.0,
+            )
+            if order_resp.status_code == 200:
+                existing_order_tracking = order_resp.json().get("order", {}).get("tracking_number")
+    except Exception as e:
+        print(f"Could not fetch order to check tracking: {e}")
+
     try:
         async with httpx.AsyncClient() as client:
             update_data = {"label_id": label_id}
-            if label["tracking_number"]:
+            if label["tracking_number"] and not existing_order_tracking:
                 update_data["tracking_number"] = label["tracking_number"]
-            
+
             await client.patch(
                 f"{orders_service_url}/orders/{order_id}",
                 json=update_data,
                 headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
-                timeout=10.0
+                timeout=10.0,
             )
     except Exception as e:
         print(f"Failed to update order with label_id: {e}")
@@ -255,10 +374,12 @@ async def assign_label(label_id: str, request: Request):
     return {"ok": True, "label_id": label_id, "order_id": order_id}
 
 
+# ---------------------------------------------------------------------------
 # GET /labels/{label_id}/download - get signed URL
+# ---------------------------------------------------------------------------
 @router.get("/{label_id}/download")
 async def download_label(label_id: str, request: Request):
-    user = get_current_user(request)
+    get_current_user(request)
     db = request.app.state.db
 
     row = await db.fetchrow(

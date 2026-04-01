@@ -21,6 +21,8 @@ async def startup():
         max_size=5,
         ssl="require",
     )
+    # In-memory store for background upload job progress
+    app.state.upload_jobs = {}
 
 @app.on_event("shutdown")
 async def shutdown():
