@@ -211,19 +211,35 @@ def _extract_name(lines: list) -> str | None:
 
 
 def _extract_tracking_number(lines: list) -> str | None:
-    """Extract the first recognisable carrier tracking number from the label text."""
+    """
+    Extract the first recognisable carrier tracking number from the label text.
+
+    Handles both compact numbers ("9334610990150168420911") and the common
+    formatted/spaced layout used on printed USPS labels
+    ("9334 6109 9015 0168 4209 11") by collapsing whitespace on lines that
+    consist entirely of digits and spaces before running the regexes.
+    """
     for line in lines:
-        # USPS — try the most-specific pattern first to avoid false-positives
-        m = _USPS_TRACKING_RE.search(line)
-        if m:
-            return m.group(1)
-        m = _UPS_TRACKING_RE.search(line)
-        if m:
-            return m.group(1)
-        # FedEx last — its generic digit patterns overlap with USPS barcodes
-        m = _FEDEX_TRACKING_RE.search(line)
-        if m:
-            return m.group(1)
+        # Build a list of candidates: original line, plus a space-collapsed
+        # version when the line is made up exclusively of digits and spaces
+        # (formatted tracking number like "9334 6109 9015 0168 4209 11").
+        candidates = [line]
+        collapsed = re.sub(r"\s+", "", line)
+        if collapsed != line and re.match(r"^\d{15,}$", collapsed):
+            candidates.append(collapsed)
+
+        for candidate in candidates:
+            # USPS — most specific first to avoid false-positives
+            m = _USPS_TRACKING_RE.search(candidate)
+            if m:
+                return m.group(1)
+            m = _UPS_TRACKING_RE.search(candidate)
+            if m:
+                return m.group(1)
+            # FedEx last — generic digit patterns overlap with USPS barcodes
+            m = _FEDEX_TRACKING_RE.search(candidate)
+            if m:
+                return m.group(1)
     return None
 
 
