@@ -246,8 +246,34 @@ async def get_unmatched(request: Request):
 # ---------------------------------------------------------------------------
 # POST /labels/{label_id}/confirm
 # ---------------------------------------------------------------------------
+async def _sync_order_after_confirm(orders_service_url: str, order_id: str, label_id: str, label_tracking: str, user_id: str, user_role: str):
+    """Background task: update the order with label_id, tracking, and status after confirm."""
+    headers = {"X-User-Id": user_id, "X-User-Role": user_role or "staff"}
+    try:
+        async with httpx.AsyncClient() as client:
+            # Get existing order tracking in one call
+            existing_tracking = None
+            try:
+                r = await client.get(f"{orders_service_url}/orders/{order_id}", headers=headers, timeout=15.0)
+                if r.status_code == 200:
+                    existing_tracking = r.json().get("order", {}).get("tracking_number")
+            except Exception as e:
+                print(f"[confirm bg] Could not fetch order tracking: {e}")
+
+            update_data = {"label_id": label_id}
+            if label_tracking and not existing_tracking:
+                update_data["tracking_number"] = label_tracking
+
+            await asyncio.gather(
+                client.patch(f"{orders_service_url}/orders/{order_id}", json=update_data, headers=headers, timeout=15.0),
+                client.patch(f"{orders_service_url}/orders/{order_id}/status", json={"status": "label_generated", "note": "Label confirmed"}, headers=headers, timeout=15.0),
+            )
+    except Exception as e:
+        print(f"[confirm bg] Failed to sync order {order_id}: {e}")
+
+
 @router.post("/{label_id}/confirm")
-async def confirm_label(label_id: str, request: Request):
+async def confirm_label(label_id: str, request: Request, background_tasks: BackgroundTasks):
     user = get_current_user(request)
     db = request.app.state.db
     body = await request.json()
@@ -273,42 +299,11 @@ async def confirm_label(label_id: str, request: Request):
         if not label:
             raise HTTPException(status_code=404, detail="Label not found")
 
-    # Fetch the order to see if it already has a tracking number
-    existing_order_tracking = None
-    try:
-        async with httpx.AsyncClient() as client:
-            order_resp = await client.get(
-                f"{orders_service_url}/orders/{order_id}",
-                headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
-                timeout=10.0,
-            )
-            if order_resp.status_code == 200:
-                existing_order_tracking = order_resp.json().get("order", {}).get("tracking_number")
-    except Exception as e:
-        print(f"Could not fetch order to check tracking: {e}")
-
-    # Update order: always set label_id; only set tracking if order doesn't already have one
-    try:
-        async with httpx.AsyncClient() as client:
-            update_data = {"label_id": label_id}
-            if label["tracking_number"] and not existing_order_tracking:
-                update_data["tracking_number"] = label["tracking_number"]
-
-            await client.patch(
-                f"{orders_service_url}/orders/{order_id}",
-                json=update_data,
-                headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
-                timeout=10.0,
-            )
-
-            await client.patch(
-                f"{orders_service_url}/orders/{order_id}/status",
-                json={"status": "label_generated", "note": "Label confirmed"},
-                headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
-                timeout=10.0,
-            )
-    except Exception as e:
-        print(f"Failed to update order: {e}")
+    background_tasks.add_task(
+        _sync_order_after_confirm,
+        orders_service_url, order_id, label_id,
+        label["tracking_number"], user["user_id"], user["role"],
+    )
 
     return {"ok": True, "label_id": label_id, "order_id": order_id}
 
@@ -316,8 +311,30 @@ async def confirm_label(label_id: str, request: Request):
 # ---------------------------------------------------------------------------
 # PATCH /labels/{label_id}/assign - manually assign label to order
 # ---------------------------------------------------------------------------
+async def _sync_order_after_assign(orders_service_url: str, order_id: str, label_id: str, label_tracking: str, user_id: str, user_role: str):
+    """Background task: update order with label_id and tracking after manual assign."""
+    headers = {"X-User-Id": user_id, "X-User-Role": user_role or "staff"}
+    try:
+        async with httpx.AsyncClient() as client:
+            existing_tracking = None
+            try:
+                r = await client.get(f"{orders_service_url}/orders/{order_id}", headers=headers, timeout=15.0)
+                if r.status_code == 200:
+                    existing_tracking = r.json().get("order", {}).get("tracking_number")
+            except Exception as e:
+                print(f"[assign bg] Could not fetch order tracking: {e}")
+
+            update_data = {"label_id": label_id}
+            if label_tracking and not existing_tracking:
+                update_data["tracking_number"] = label_tracking
+
+            await client.patch(f"{orders_service_url}/orders/{order_id}", json=update_data, headers=headers, timeout=15.0)
+    except Exception as e:
+        print(f"[assign bg] Failed to sync order {order_id}: {e}")
+
+
 @router.patch("/{label_id}/assign")
-async def assign_label(label_id: str, request: Request):
+async def assign_label(label_id: str, request: Request, background_tasks: BackgroundTasks):
     user = get_current_user(request)
     db = request.app.state.db
     orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3002")
@@ -342,34 +359,11 @@ async def assign_label(label_id: str, request: Request):
     if not label:
         raise HTTPException(status_code=404, detail="Label not found")
 
-    # Fetch order's existing tracking before deciding whether to update it
-    existing_order_tracking = None
-    try:
-        async with httpx.AsyncClient() as client:
-            order_resp = await client.get(
-                f"{orders_service_url}/orders/{order_id}",
-                headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
-                timeout=10.0,
-            )
-            if order_resp.status_code == 200:
-                existing_order_tracking = order_resp.json().get("order", {}).get("tracking_number")
-    except Exception as e:
-        print(f"Could not fetch order to check tracking: {e}")
-
-    try:
-        async with httpx.AsyncClient() as client:
-            update_data = {"label_id": label_id}
-            if label["tracking_number"] and not existing_order_tracking:
-                update_data["tracking_number"] = label["tracking_number"]
-
-            await client.patch(
-                f"{orders_service_url}/orders/{order_id}",
-                json=update_data,
-                headers={"X-User-Id": user["user_id"], "X-User-Role": user["role"] or "staff"},
-                timeout=10.0,
-            )
-    except Exception as e:
-        print(f"Failed to update order with label_id: {e}")
+    background_tasks.add_task(
+        _sync_order_after_assign,
+        orders_service_url, order_id, label_id,
+        label["tracking_number"], user["user_id"], user["role"],
+    )
 
     return {"ok": True, "label_id": label_id, "order_id": order_id}
 
