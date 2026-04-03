@@ -284,8 +284,8 @@ async def confirm_label(label_id: str, request: Request, background_tasks: Backg
 
     orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3002")
 
-    async with db.transaction():
-        label = await db.fetchrow(
+    async with db.acquire() as conn:
+        label = await conn.fetchrow(
             """
             UPDATE labels.shipping_labels
             SET match_status = 'confirmed', order_id = $1,
@@ -296,8 +296,8 @@ async def confirm_label(label_id: str, request: Request, background_tasks: Backg
             order_id, user["user_id"], label_id,
         )
 
-        if not label:
-            raise HTTPException(status_code=404, detail="Label not found")
+    if not label:
+        raise HTTPException(status_code=404, detail="Label not found")
 
     background_tasks.add_task(
         _sync_order_after_confirm,
