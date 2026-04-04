@@ -143,12 +143,41 @@ def _looks_like_address(text: str) -> bool:
 
 
 def _collect_address(lines: list, start: int) -> str | None:
-    """Pull address_line1 + city/state/zip starting at lines[start]."""
+    """
+    Pull street + city/state/zip starting at lines[start].
+    Scans up to 5 lines so apt/suite lines don't break extraction.
+    Stops early if a new section header (FROM, PRIORITY, etc.) is found.
+    """
     if start >= len(lines):
         return None
-    addr_line1 = lines[start].strip()
-    addr_line2 = lines[start + 1].strip() if start + 1 < len(lines) else ""
-    return _build_address(addr_line1, addr_line2)
+
+    _SECTION_STOP_RE = re.compile(
+        r"^(FROM|RETURN|SHIP\s+FROM|PRIORITY|EXPRESS|GROUND|UPS|USPS|FEDEX)\s*:?\s*$",
+        re.IGNORECASE,
+    )
+
+    street = None
+    city_zip = None
+
+    for i in range(start, min(start + 5, len(lines))):
+        line = lines[i].strip()
+        if not line:
+            continue
+        if _SECTION_STOP_RE.match(line):
+            break
+        if re.match(r"^\d+\s", line) and street is None:
+            street = line
+        if _CITY_STATE_ZIP_RE.search(line) and city_zip is None:
+            city_zip = line
+        if street and city_zip:
+            break
+
+    if street and city_zip:
+        return f"{street}, {city_zip}".upper()
+    if street:
+        return street.upper()
+    # Fall back to first non-empty line at start position
+    return lines[start].strip().upper() if start < len(lines) else None
 
 
 def _build_address(line1: str, line2: str) -> str | None:
@@ -244,30 +273,87 @@ def _extract_tracking_number(lines: list) -> str | None:
 
 
 def _extract_address(lines: list) -> str | None:
-    """Fallback address extraction."""
-    street_pattern = re.compile(r"^\d+\s+\w+", re.IGNORECASE)
-    # Comma optional: "CAPE CORAL FL 33909" or "Cape Coral, FL 33909"
-    city_state_zip = re.compile(r"[A-Za-z][A-Za-z\s]+,?\s+[A-Z]{2}\s+\d{5}", re.IGNORECASE)
+    """
+    Fallback address extraction used when no SHIP TO anchor is found.
 
-    street_line = None
-    city_line = None
+    Collects ALL (street, city/state/zip) pairs in the document, then returns
+    the one most likely to be the recipient:
+      1. First address found AFTER a SHIP TO / DELIVER TO marker
+      2. Otherwise the address NOT associated with a FROM / RETURN block
+      3. Otherwise the LAST address in the document (recipient follows sender)
+    """
+    street_pattern  = re.compile(r"^\d+\s+\w+", re.IGNORECASE)
+    city_state_zip  = re.compile(r"[A-Za-z][A-Za-z\s]+,?\s+[A-Z]{2}\s+\d{5}", re.IGNORECASE)
+    from_pattern    = re.compile(r"^(FROM|RETURN\s*ADDRESS|SHIP\s*FROM|RETURN)\s*:?", re.IGNORECASE)
+    ship_to_pattern = re.compile(r"^(SHIP\s*TO|DELIVER\s*TO)\s*:?", re.IGNORECASE)
 
-    for line in lines:
-        # Skip lines that mention carrier/service names
+    from_idx    = next((i for i, l in enumerate(lines) if from_pattern.match(l)),    None)
+    ship_to_idx = next((i for i, l in enumerate(lines) if ship_to_pattern.match(l)), None)
+
+    # Build list of (line_index, full_address_string) candidates
+    candidates: list[tuple[int, str]] = []
+    for i, line in enumerate(lines):
         lower_words = {w.lower().rstrip(".,") for w in line.split()}
         if lower_words & CARRIER_KEYWORDS:
             continue
-        if street_pattern.match(line) and not street_line:
-            street_line = line
-        if city_state_zip.search(line) and not city_line:
-            city_line = line
+        if not street_pattern.match(line):
+            continue
+        # Look ahead up to 4 lines for a city/state/zip
+        city_line = None
+        for j in range(i + 1, min(i + 5, len(lines))):
+            if city_state_zip.search(lines[j]):
+                city_line = lines[j]
+                break
+        addr = f"{line}, {city_line}".upper() if city_line else line.upper()
+        candidates.append((i, addr))
 
-    if street_line and city_line:
-        return f"{street_line}, {city_line}".upper()
-    elif street_line:
-        return street_line.upper()
+    if not candidates:
+        return None
 
-    return None
+    # Preference 1: address after SHIP TO marker
+    if ship_to_idx is not None:
+        after_ship = [(idx, a) for idx, a in candidates if idx > ship_to_idx]
+        if after_ship:
+            return after_ship[0][1]
+
+    # Preference 2: address outside the FROM block (±4 lines around from_idx)
+    if from_idx is not None:
+        not_from = [(idx, a) for idx, a in candidates
+                    if idx < from_idx - 1 or idx > from_idx + 4]
+        if not_from:
+            return not_from[-1][1]  # last non-FROM address = recipient
+
+    # Preference 3: last address in document (recipient typically follows sender)
+    return candidates[-1][1] if len(candidates) > 1 else candidates[0][1]
+
+
+# ── Right-half crop extraction ────────────────────────────────────────────────
+
+def _extract_text_right_half(pdf_bytes: bytes) -> str:
+    """
+    Extract text from the right ~58% of the page using pdfplumber crop.
+
+    Many thermal label formats (UPS, FedEx, USPS commercial) are two-column:
+    FROM on the left, SHIP TO on the right.  pdfplumber's default full-page
+    extract_text() interleaves both columns by Y-position, which can surface
+    the sender's address before the recipient's.  Cropping to the right half
+    isolates the recipient block so the anchored SHIP TO regex has a clean
+    input to work with.
+    """
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                # 42% from left keeps a small margin — catches labels where the
+                # SHIP TO block starts slightly left of centre.
+                mid_x = page.width * 0.42
+                right = page.crop((mid_x, 0, page.width, page.height))
+                text = right.extract_text()
+                if text and text.strip():
+                    logger.info(f"Right-half crop extracted {len(text)} chars")
+                    return text
+    except Exception as e:
+        logger.warning(f"Right-half pdfplumber extraction failed: {e}")
+    return ""
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -318,20 +404,34 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
     logger.info(f"Extracted {len(lines)} lines from PDF")
     logger.debug(f"Lines: {lines[:30]}")
 
-    # Step 3: anchored SHIP TO extraction
+    # Step 3: anchored SHIP TO extraction on full-page text
     name, address = _extract_ship_to(lines)
+
+    # Step 3b: if no SHIP TO found, try right-half crop (two-column label formats).
+    # UPS / FedEx / USPS commercial labels often have FROM on the left and SHIP TO
+    # on the right; full-page extraction interleaves them by Y-position.
+    if not (name or address) and not result["is_image_pdf"]:
+        right_text = _extract_text_right_half(pdf_bytes)
+        if right_text.strip():
+            right_lines = [l.strip() for l in right_text.split("\n") if l.strip()]
+            name, address = _extract_ship_to(right_lines)
+            if name or address:
+                logger.info(f"Right-half SHIP TO → name={name!r}, address={address!r}")
+                # Keep full lines for tracking extraction (tracking may be on left half)
+            else:
+                logger.info("Right-half extraction: no SHIP TO found, will use heuristics")
 
     if name or address:
         logger.info(f"Anchored extraction → name={name!r}, address={address!r}")
         result["customer_name"] = name
         result["address"] = address
     else:
-        # Step 4: generic heuristics
+        # Step 4: generic heuristics — now FROM-aware and prefers last/recipient address
         logger.info("No SHIP TO section found — using generic heuristics")
         result["customer_name"] = _extract_name(lines)
         result["address"] = _extract_address(lines)
 
-    # Step 5: extract tracking number
+    # Step 5: extract tracking number (always use full-page lines for best coverage)
     result["tracking_number"] = _extract_tracking_number(lines)
     if result["tracking_number"]:
         logger.info(f"Extracted tracking number: {result['tracking_number']}")
