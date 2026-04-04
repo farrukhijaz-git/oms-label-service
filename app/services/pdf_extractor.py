@@ -21,14 +21,21 @@ def split_pdf_pages(pdf_bytes: bytes) -> list:
 
 
 def _ocr_pdf_page(pdf_bytes: bytes) -> str:
-    """OCR a single-page PDF using tesseract. Returns extracted text or empty string."""
+    """
+    OCR a single-page PDF using tesseract. Returns extracted text or empty string.
+
+    Uses 300 DPI for better character recognition on shipping labels (the default
+    200 DPI causes garbled output on bold/large fonts like USPS Ground Advantage).
+    PSM 3 (fully auto) is kept so tesseract can handle the mixed layout (logo,
+    FROM block, SHIP TO block, barcode, product line).
+    """
     try:
         from pdf2image import convert_from_bytes
         import pytesseract
-        images = convert_from_bytes(pdf_bytes, dpi=200)
+        images = convert_from_bytes(pdf_bytes, dpi=300)
         if not images:
             return ""
-        text = pytesseract.image_to_string(images[0])
+        text = pytesseract.image_to_string(images[0], config='--oem 3 --psm 3')
         logger.info(f"OCR extracted {len(text)} chars")
         return text
     except Exception as e:
@@ -389,7 +396,7 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
     except Exception as e:
         logger.warning(f"pdfplumber extraction error: {e}")
 
-    # Step 2: OCR fallback
+    # Step 2: OCR fallback for fully image-based PDFs (pdfplumber found nothing)
     if not all_text.strip():
         result["is_image_pdf"] = True
         logger.info("No text from pdfplumber — attempting OCR")
@@ -417,21 +424,43 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
             name, address = _extract_ship_to(right_lines)
             if name or address:
                 logger.info(f"Right-half SHIP TO → name={name!r}, address={address!r}")
-                # Keep full lines for tracking extraction (tracking may be on left half)
             else:
                 logger.info("Right-half extraction: no SHIP TO found, will use heuristics")
+
+    # Step 3c: OCR supplement — fires when pdfplumber found some text BUT could not
+    # locate a recipient name.  This covers labels (e.g. USPS Ground Advantage) where
+    # the FROM address is in a standard PDF font (readable by pdfplumber) while the
+    # SHIP TO block and tracking number use a non-standard / embedded font that
+    # pdfplumber decodes as garbage or skips entirely.  OCR on the rasterised page
+    # reads the visual glyphs correctly regardless of font encoding.
+    if not name and not result["is_image_pdf"] and all_text.strip():
+        logger.info("pdfplumber found partial text but no recipient — running OCR supplement")
+        ocr_text = _ocr_pdf_page(pdf_bytes)
+        if ocr_text.strip():
+            ocr_lines = [l.strip() for l in ocr_text.split("\n") if l.strip()]
+            ocr_name, ocr_address = _extract_ship_to(ocr_lines)
+            if ocr_name or ocr_address:
+                name    = ocr_name
+                address = ocr_address
+                lines   = ocr_lines   # switch to OCR lines for tracking extraction
+                logger.info(f"OCR supplement found: name={name!r}, address={address!r}")
+            else:
+                # OCR didn't find SHIP TO either, but its content is richer than
+                # pdfplumber's partial decode — use it for heuristics + tracking
+                lines = ocr_lines
+                logger.info("OCR supplement: no SHIP TO, using OCR lines for heuristics")
 
     if name or address:
         logger.info(f"Anchored extraction → name={name!r}, address={address!r}")
         result["customer_name"] = name
         result["address"] = address
     else:
-        # Step 4: generic heuristics — now FROM-aware and prefers last/recipient address
+        # Step 4: generic heuristics — FROM-aware, prefers last/recipient address
         logger.info("No SHIP TO section found — using generic heuristics")
         result["customer_name"] = _extract_name(lines)
         result["address"] = _extract_address(lines)
 
-    # Step 5: extract tracking number (always use full-page lines for best coverage)
+    # Step 5: extract tracking number (always use the richest line set available)
     result["tracking_number"] = _extract_tracking_number(lines)
     if result["tracking_number"]:
         logger.info(f"Extracted tracking number: {result['tracking_number']}")
