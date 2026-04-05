@@ -76,18 +76,44 @@ _CITY_STATE_ZIP_RE = re.compile(r"[A-Za-z][A-Za-z\s]+,?\s+[A-Z]{2}\s+\d{5}", re.
 
 # Tracking number patterns for common carriers
 _USPS_TRACKING_RE = re.compile(r"\b(9[0-9]{21,34}|[A-Z]{2}[0-9]{9}US|420[0-9]{5}[A-Z]{2}[0-9]{24})\b")
-_UPS_TRACKING_RE = re.compile(r"\b(1Z[A-Z0-9]{16})\b")
+_UPS_TRACKING_RE  = re.compile(r"\b(1Z[A-Z0-9]{16})\b")
 _FEDEX_TRACKING_RE = re.compile(r"\b([0-9]{12}|[0-9]{15}|[0-9]{20})\b")
+
+
+# ── Carrier detection ─────────────────────────────────────────────────────────
+
+def detect_carrier(text: str) -> str | None:
+    """
+    Detect carrier from tracking number patterns in raw PDF text.
+    Returns 'usps', 'ups', 'fedex', or None.
+
+    Collapses space-formatted tracking numbers (e.g. "9400 1234 5678 ...")
+    before matching so both compact and formatted variants are detected.
+    USPS is checked first because its patterns are most specific; FedEx
+    is checked last because its digit-only patterns overlap with other numbers.
+    """
+    # Collapse spaces between digit groups (formatted tracking numbers)
+    collapsed = re.sub(r'(?<=\d) +(?=\d)', '', text)
+
+    if _USPS_TRACKING_RE.search(collapsed):
+        return 'usps'
+    if _UPS_TRACKING_RE.search(text):
+        return 'ups'
+    if _FEDEX_TRACKING_RE.search(collapsed):
+        return 'fedex'
+    return None
 
 
 def _extract_ship_to(lines: list) -> tuple:
     """
     Anchor on SHIP TO / DELIVER TO keywords to extract recipient name + address.
 
-    Handles three common label formats:
+    Handles four common label formats:
       A) "SHIP TO: Firstname Lastname" then address lines (single combined line)
       B) "SHIP TO:"  (empty) then name on next line then address (multi-line)
+         Skips carrier service lines (e.g. "PRIORITY MAIL®") between anchor and name.
       C) "SHIP  Firstname Lastname" / "TO:  123 Main St" (USPS two-column format)
+      D) Standalone "TO:" or "TO" on its own line (USPS Priority Mail / Pirateship)
 
     Returns (name, address) or (None, None) if no shipping section found.
     """
@@ -179,13 +205,16 @@ def _collect_address(lines: list, start: int) -> str | None:
     """
     Pull street + city/state/zip starting at lines[start].
     Scans up to 5 lines so apt/suite lines don't break extraction.
-    Stops early if a new section header (FROM, PRIORITY, etc.) is found.
+    Stops early if a new section header (FROM, PRIORITY MAIL, etc.) is found.
     """
     if start >= len(lines):
         return None
 
+    # Stop collecting when we hit a new section header.
+    # Uses \b so "FROM: Sender Name 123..." (inline) also stops the scan —
+    # the previous pattern required the keyword to be alone on the line.
     _SECTION_STOP_RE = re.compile(
-        r"^(FROM|RETURN|SHIP\s+FROM|PRIORITY|EXPRESS|GROUND|UPS|USPS|FEDEX)\s*:?\s*$",
+        r"^(FROM|RETURN\s*ADDRESS|RETURN|SHIP\s+FROM|PRIORITY\s+MAIL|EXPRESS\s+MAIL)\b",
         re.IGNORECASE,
     )
 
@@ -201,6 +230,7 @@ def _collect_address(lines: list, start: int) -> str | None:
         # Skip tracking/barcode number lines — on USPS Priority Mail labels the
         # barcode number appears directly below the recipient name before the
         # street address, and starts with digits which fools the street detector.
+        # Pattern: starts with digit, rest is digits+spaces, total 15+ chars.
         if re.match(r'^\d[\d\s]{14,}$', line):
             continue
         if re.match(r"^\d+\s", line) and street is None:
@@ -214,10 +244,10 @@ def _collect_address(lines: list, start: int) -> str | None:
         return f"{street}, {city_zip}".upper()
     if street:
         return street.upper()
-    # Fall back to first non-empty line at start position that isn't a tracking number
+    # Fall back to first non-empty, non-tracking-number line at start position
     for j in range(start, min(start + 5, len(lines))):
         fb = lines[j].strip()
-        if fb and not re.match(r'^\d[\d\s]{14,}$', fb):
+        if fb and not re.match(r'^\d[\d\s]{14,}$', fb) and not _SECTION_STOP_RE.match(fb):
             return fb.upper()
     return None
 
@@ -294,9 +324,6 @@ def _extract_tracking_number(lines: list) -> str | None:
     consist entirely of digits and spaces before running the regexes.
     """
     for line in lines:
-        # Build a list of candidates: original line, plus a space-collapsed
-        # version when the line is made up exclusively of digits and spaces
-        # (formatted tracking number like "9334 6109 9015 0168 4209 11").
         candidates = [line]
         collapsed = re.sub(r"\s+", "", line)
         if collapsed != line and re.match(r"^\d{15,}$", collapsed):
@@ -323,7 +350,7 @@ def _extract_address(lines: list) -> str | None:
 
     Collects ALL (street, city/state/zip) pairs in the document, then returns
     the one most likely to be the recipient:
-      1. First address found AFTER a SHIP TO / DELIVER TO marker
+      1. First address found AFTER a SHIP TO / DELIVER TO / TO: marker
       2. Otherwise the address NOT associated with a FROM / RETURN block
       3. Otherwise the LAST address in the document (recipient follows sender)
     """
@@ -391,8 +418,6 @@ def _extract_text_right_half(pdf_bytes: bytes) -> str:
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
-                # 42% from left keeps a small margin — catches labels where the
-                # SHIP TO block starts slightly left of centre.
                 mid_x = page.width * 0.42
                 right = page.crop((mid_x, 0, page.width, page.height))
                 text = right.extract_text()
@@ -410,24 +435,29 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
     """
     Extract customer name, address, and tracking number from a single-page PDF.
 
-    Strategy:
-      1. pdfplumber text extraction
-      2. OCR fallback for image-based PDFs
-      3. SHIP TO / DELIVER TO anchored extraction (covers USPS, UPS, FedEx)
-      4. Generic heuristic fallback if no shipping section found
-      5. Tracking number extraction
+    Extraction strategy is selected based on carrier detected from tracking number:
+
+      USPS  — single-column labels: full-page anchored → OCR supplement for
+              non-standard fonts (Ground Advantage, some Priority Mail variants)
+      UPS / FedEx — two-column thermal labels: right-half crop first (isolates
+              SHIP TO from interleaved FROM column) → full-page anchored fallback
+      Unknown — full waterfall: full-page → right-half crop → OCR supplement
+
+    In all cases, generic heuristics are used as a last resort if anchored
+    extraction finds nothing.
     """
     result = {
         "customer_name": None,
         "address": None,
         "tracking_number": None,
+        "carrier": None,
         "is_image_pdf": False,
         "raw_text": "",
     }
 
     all_text = ""
 
-    # Step 1: pdfplumber
+    # Step 1: pdfplumber full-page text extraction
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
@@ -450,61 +480,94 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
     result["raw_text"] = all_text
     lines = [line.strip() for line in all_text.split("\n") if line.strip()]
     logger.info(f"Extracted {len(lines)} lines from PDF")
-    logger.debug(f"Lines: {lines[:30]}")
+    logger.info(f"RAW LINES: {lines[:40]}")
 
-    # Step 3: anchored SHIP TO extraction on full-page text
-    name, address = _extract_ship_to(lines)
+    # Step 3: carrier detection from tracking number in raw text
+    carrier = detect_carrier(all_text)
+    result["carrier"] = carrier
+    logger.info(f"Carrier detected: {carrier or 'unknown'}")
 
-    # Step 3b: if no SHIP TO found, try right-half crop (two-column label formats).
-    # UPS / FedEx / USPS commercial labels often have FROM on the left and SHIP TO
-    # on the right; full-page extraction interleaves them by Y-position.
-    if not (name or address) and not result["is_image_pdf"]:
+    name, address = None, None
+
+    if carrier in ('ups', 'fedex'):
+        # ── UPS / FedEx ───────────────────────────────────────────────────────
+        # Thermal labels are almost always two-column (FROM left, SHIP TO right).
+        # Right-half crop is more reliable than full-page for these carriers.
         right_text = _extract_text_right_half(pdf_bytes)
         if right_text.strip():
             right_lines = [l.strip() for l in right_text.split("\n") if l.strip()]
             name, address = _extract_ship_to(right_lines)
             if name or address:
-                logger.info(f"Right-half SHIP TO → name={name!r}, address={address!r}")
-            else:
-                logger.info("Right-half extraction: no SHIP TO found, will use heuristics")
+                logger.info(f"UPS/FedEx right-half → name={name!r}, address={address!r}")
+        if not (name or address):
+            name, address = _extract_ship_to(lines)
+            if name or address:
+                logger.info(f"UPS/FedEx full-page → name={name!r}, address={address!r}")
 
-    # Step 3c: OCR supplement — fires when pdfplumber found some text BUT could not
-    # locate a recipient name.  This covers labels (e.g. USPS Ground Advantage) where
-    # the FROM address is in a standard PDF font (readable by pdfplumber) while the
-    # SHIP TO block and tracking number use a non-standard / embedded font that
-    # pdfplumber decodes as garbage or skips entirely.  OCR on the rasterised page
-    # reads the visual glyphs correctly regardless of font encoding.
-    if not name and not result["is_image_pdf"] and all_text.strip():
-        logger.info("pdfplumber found partial text but no recipient — running OCR supplement")
-        ocr_text = _ocr_pdf_page(pdf_bytes)
-        if ocr_text.strip():
-            ocr_lines = [l.strip() for l in ocr_text.split("\n") if l.strip()]
-            ocr_name, ocr_address = _extract_ship_to(ocr_lines)
-            if ocr_name or ocr_address:
-                name    = ocr_name
-                address = ocr_address
-                lines   = ocr_lines   # switch to OCR lines for tracking extraction
-                logger.info(f"OCR supplement found: name={name!r}, address={address!r}")
-            else:
-                # OCR didn't find SHIP TO either, but its content is richer than
-                # pdfplumber's partial decode — use it for heuristics + tracking
-                lines = ocr_lines
-                logger.info("OCR supplement: no SHIP TO, using OCR lines for heuristics")
+    elif carrier == 'usps':
+        # ── USPS ──────────────────────────────────────────────────────────────
+        # Labels are typically single-column; anchored extraction handles all
+        # USPS format variants (SHIP TO:, TO:, DELIVER TO:, two-column Ground
+        # Advantage).  OCR supplement fires when pdfplumber finds partial text
+        # but no recipient — covers Ground Advantage and some Priority Mail
+        # variants where the SHIP TO block uses a non-standard embedded font.
+        name, address = _extract_ship_to(lines)
+        if name or address:
+            logger.info(f"USPS full-page → name={name!r}, address={address!r}")
+
+        if not name and not result["is_image_pdf"] and all_text.strip():
+            logger.info("USPS: no recipient found — running OCR supplement")
+            ocr_text = _ocr_pdf_page(pdf_bytes)
+            if ocr_text.strip():
+                ocr_lines = [l.strip() for l in ocr_text.split("\n") if l.strip()]
+                ocr_name, ocr_address = _extract_ship_to(ocr_lines)
+                if ocr_name or ocr_address:
+                    name, address = ocr_name, ocr_address
+                    lines = ocr_lines   # richer text for tracking extraction
+                    logger.info(f"USPS OCR supplement → name={name!r}, address={address!r}")
+                else:
+                    lines = ocr_lines
+                    logger.info("USPS OCR supplement: no SHIP TO, using OCR lines for heuristics")
+
+    else:
+        # ── Unknown carrier: full waterfall ───────────────────────────────────
+        name, address = _extract_ship_to(lines)
+
+        if not (name or address) and not result["is_image_pdf"]:
+            right_text = _extract_text_right_half(pdf_bytes)
+            if right_text.strip():
+                right_lines = [l.strip() for l in right_text.split("\n") if l.strip()]
+                name, address = _extract_ship_to(right_lines)
+                if name or address:
+                    logger.info(f"Unknown right-half → name={name!r}, address={address!r}")
+
+        if not name and not result["is_image_pdf"] and all_text.strip():
+            logger.info("Unknown carrier: no recipient — running OCR supplement")
+            ocr_text = _ocr_pdf_page(pdf_bytes)
+            if ocr_text.strip():
+                ocr_lines = [l.strip() for l in ocr_text.split("\n") if l.strip()]
+                ocr_name, ocr_address = _extract_ship_to(ocr_lines)
+                if ocr_name or ocr_address:
+                    name, address = ocr_name, ocr_address
+                    lines = ocr_lines
+                    logger.info(f"Unknown OCR supplement → name={name!r}, address={address!r}")
+                else:
+                    lines = ocr_lines
 
     if name or address:
-        logger.info(f"Anchored extraction → name={name!r}, address={address!r}")
+        logger.info(f"Anchored extraction result → name={name!r}, address={address!r}")
         result["customer_name"] = name
         result["address"] = address
     else:
-        # Step 4: generic heuristics — FROM-aware, prefers last/recipient address
-        logger.info("No SHIP TO section found — using generic heuristics")
+        # Last resort: generic heuristics (FROM-aware address preference)
+        logger.info("No anchored result — using generic heuristics")
         result["customer_name"] = _extract_name(lines)
         result["address"] = _extract_address(lines)
 
-    # Step 5: extract tracking number (always use the richest line set available)
+    # Step 5: tracking number extraction (always use richest line set available)
     result["tracking_number"] = _extract_tracking_number(lines)
     if result["tracking_number"]:
-        logger.info(f"Extracted tracking number: {result['tracking_number']}")
+        logger.info(f"Tracking number: {result['tracking_number']}")
 
     return result
 

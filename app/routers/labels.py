@@ -248,27 +248,48 @@ async def get_unmatched(request: Request):
 # POST /labels/{label_id}/confirm
 # ---------------------------------------------------------------------------
 async def _sync_order_after_confirm(orders_service_url: str, order_id: str, label_id: str, label_tracking: str, user_id: str, user_role: str):
-    """Background task: update the order with label_id, tracking, and status after confirm."""
+    """Background task: update the order with label_id, tracking, and status after confirm.
+    Only sets label_id on the order if no primary label is already attached (multi-label support).
+    Only advances status to label_generated if current status is 'new'.
+    """
     headers = {"X-User-Id": user_id, "X-User-Role": user_role or "staff"}
     try:
         async with httpx.AsyncClient() as client:
-            # Get existing order tracking in one call
             existing_tracking = None
+            existing_label_id = None
+            current_status = None
             try:
                 r = await client.get(f"{orders_service_url}/orders/{order_id}", headers=headers, timeout=15.0)
                 if r.status_code == 200:
-                    existing_tracking = r.json().get("order", {}).get("tracking_number")
+                    order_data = r.json().get("order", {})
+                    existing_tracking = order_data.get("tracking_number")
+                    existing_label_id = order_data.get("label_id")
+                    current_status = order_data.get("status")
             except Exception as e:
-                print(f"[confirm bg] Could not fetch order tracking: {e}")
+                print(f"[confirm bg] Could not fetch order: {e}")
 
-            update_data = {"label_id": label_id}
+            tasks = []
+
+            # Only set label_id on the order if this is the first label
+            update_data = {}
+            if not existing_label_id:
+                update_data["label_id"] = label_id
             if label_tracking and not existing_tracking:
                 update_data["tracking_number"] = label_tracking
 
-            await asyncio.gather(
-                client.patch(f"{orders_service_url}/orders/{order_id}", json=update_data, headers=headers, timeout=15.0),
-                client.patch(f"{orders_service_url}/orders/{order_id}/status", json={"status": "label_generated", "note": "Label confirmed"}, headers=headers, timeout=15.0),
-            )
+            if update_data:
+                tasks.append(
+                    client.patch(f"{orders_service_url}/orders/{order_id}", json=update_data, headers=headers, timeout=15.0)
+                )
+
+            # Only advance status if currently 'new'
+            if current_status == "new":
+                tasks.append(
+                    client.patch(f"{orders_service_url}/orders/{order_id}/status", json={"status": "label_generated", "note": "Label confirmed"}, headers=headers, timeout=15.0)
+                )
+
+            if tasks:
+                await asyncio.gather(*tasks)
     except Exception as e:
         print(f"[confirm bg] Failed to sync order {order_id}: {e}")
 
@@ -313,23 +334,31 @@ async def confirm_label(label_id: str, request: Request, background_tasks: Backg
 # PATCH /labels/{label_id}/assign - manually assign label to order
 # ---------------------------------------------------------------------------
 async def _sync_order_after_assign(orders_service_url: str, order_id: str, label_id: str, label_tracking: str, user_id: str, user_role: str):
-    """Background task: update order with label_id and tracking after manual assign."""
+    """Background task: update order with label_id and tracking after manual assign.
+    Only sets label_id on the order if no primary label is already attached (multi-label support).
+    """
     headers = {"X-User-Id": user_id, "X-User-Role": user_role or "staff"}
     try:
         async with httpx.AsyncClient() as client:
             existing_tracking = None
+            existing_label_id = None
             try:
                 r = await client.get(f"{orders_service_url}/orders/{order_id}", headers=headers, timeout=15.0)
                 if r.status_code == 200:
-                    existing_tracking = r.json().get("order", {}).get("tracking_number")
+                    order_data = r.json().get("order", {})
+                    existing_tracking = order_data.get("tracking_number")
+                    existing_label_id = order_data.get("label_id")
             except Exception as e:
-                print(f"[assign bg] Could not fetch order tracking: {e}")
+                print(f"[assign bg] Could not fetch order: {e}")
 
-            update_data = {"label_id": label_id}
+            update_data = {}
+            if not existing_label_id:
+                update_data["label_id"] = label_id
             if label_tracking and not existing_tracking:
                 update_data["tracking_number"] = label_tracking
 
-            await client.patch(f"{orders_service_url}/orders/{order_id}", json=update_data, headers=headers, timeout=15.0)
+            if update_data:
+                await client.patch(f"{orders_service_url}/orders/{order_id}", json=update_data, headers=headers, timeout=15.0)
     except Exception as e:
         print(f"[assign bg] Failed to sync order {order_id}: {e}")
 
@@ -391,6 +420,29 @@ async def download_label(label_id: str, request: Request):
     except Exception as e:
         print(f"Error generating signed URL: {e}")
         raise HTTPException(status_code=500, detail="Could not generate download URL")
+
+
+# ---------------------------------------------------------------------------
+# GET /labels/by-order/{order_id} — all labels linked to an order
+# ---------------------------------------------------------------------------
+@router.get("/by-order/{order_id}")
+async def get_labels_by_order(order_id: str, request: Request):
+    get_current_user(request)
+    db = request.app.state.db
+
+    rows = await db.fetch(
+        """
+        SELECT id, original_filename, extracted_name, extracted_address,
+               tracking_number, match_confidence, match_status, order_id,
+               uploaded_by, confirmed_by, confirmed_at, uploaded_at
+        FROM labels.shipping_labels
+        WHERE order_id = $1
+        ORDER BY uploaded_at ASC
+        """,
+        order_id,
+    )
+
+    return {"labels": [dict(r) for r in rows]}
 
 
 # ---------------------------------------------------------------------------
