@@ -25,3 +25,8 @@ def get_signed_url(storage_path: str, expires_in: int = 3600) -> str:
     client = get_supabase()
     response = client.storage.from_(BUCKET).create_signed_url(storage_path, expires_in)
     return response["signedURL"]
+
+def delete_pdf(storage_path: str) -> None:
+    """Delete a PDF from Supabase Storage."""
+    client = get_supabase()
+    client.storage.from_(BUCKET).remove([storage_path])

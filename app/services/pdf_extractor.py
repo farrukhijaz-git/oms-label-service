@@ -68,6 +68,9 @@ _SHIP_TO_RE   = re.compile(r"^SHIP\s+TO:?\s*(.*)", re.IGNORECASE)
 _SHIP_NAME_RE = re.compile(r"^SHIP\s+(?!TO)(.+)", re.IGNORECASE)
 _TO_RE        = re.compile(r"^TO:\s*(.*)", re.IGNORECASE)
 _DELIVER_RE   = re.compile(r"^DELIVER\s+TO:?\s*(.*)", re.IGNORECASE)
+# Standalone "TO:" or "TO" on its own line — USPS Priority Mail labels from
+# some generators (Pirateship, Stamps.com) omit "SHIP" and just say "TO:"
+_TO_ANCHOR_RE = re.compile(r"^TO:?\s*$", re.IGNORECASE)
 # City/state/zip — comma optional (CAPE CORAL FL 33909 or CAPE CORAL, FL 33909)
 _CITY_STATE_ZIP_RE = re.compile(r"[A-Za-z][A-Za-z\s]+,?\s+[A-Z]{2}\s+\d{5}", re.IGNORECASE)
 
@@ -99,14 +102,25 @@ def _extract_ship_to(lines: list) -> tuple:
                 name = remainder
                 addr_start = i + 1
             else:
-                # Format B: name on next line
+                # Format B: name on next line.  Some USPS Priority Mail labels
+                # insert a service line (e.g. "PRIORITY MAIL®") between the
+                # "SHIP TO:" header and the actual recipient name.  Scan up to
+                # 3 lines ahead to skip any carrier/service keyword lines.
                 if i + 1 >= len(lines):
                     return None, None
-                name = lines[i + 1].strip()
+                name = None
                 addr_start = i + 2
+                for offset in range(1, 4):
+                    if i + offset >= len(lines):
+                        break
+                    candidate = lines[i + offset].strip()
+                    if _clean_name(candidate) is not None:
+                        name = candidate
+                        addr_start = i + offset + 1
+                        break
 
             address = _collect_address(lines, addr_start)
-            return _clean_name(name), address
+            return _clean_name(name) if name else None, address
 
         # ── Format C: "SHIP  Antonia Pantoja Vidal" (USPS two-column) ────────
         m = _SHIP_NAME_RE.match(line)
@@ -138,6 +152,18 @@ def _extract_ship_to(lines: list) -> tuple:
                 name = lines[i + 1].strip()
                 addr_start = i + 2
 
+            address = _collect_address(lines, addr_start)
+            return _clean_name(name), address
+
+        # ── Format D: standalone "TO:" / "TO" (USPS Priority Mail) ───────────
+        # Some label generators (Pirateship, Stamps.com Priority Mail) omit the
+        # "SHIP" prefix entirely and just print "TO:" on its own line.
+        m = _TO_ANCHOR_RE.match(line)
+        if m:
+            if i + 1 >= len(lines):
+                return None, None
+            name = lines[i + 1].strip()
+            addr_start = i + 2
             address = _collect_address(lines, addr_start)
             return _clean_name(name), address
 
@@ -237,8 +263,11 @@ def _extract_name(lines: list) -> str | None:
             continue
         if lower_words & CARRIER_KEYWORDS:
             continue
-        # Skip all-caps single-word repeated patterns (barcodes, service names)
-        if all(w.isupper() for w in words):
+        # Reject single-word all-caps (service labels like "CERTIFIED", "EXPRESS").
+        # Multi-word all-caps is the norm for names on shipping labels ("JOHN DOE")
+        # and must NOT be rejected here — carrier keywords above already filter
+        # service lines like "PRIORITY MAIL".
+        if len(words) == 1 and words[0].isupper():
             continue
 
         return line
@@ -292,7 +321,7 @@ def _extract_address(lines: list) -> str | None:
     street_pattern  = re.compile(r"^\d+\s+\w+", re.IGNORECASE)
     city_state_zip  = re.compile(r"[A-Za-z][A-Za-z\s]+,?\s+[A-Z]{2}\s+\d{5}", re.IGNORECASE)
     from_pattern    = re.compile(r"^(FROM|RETURN\s*ADDRESS|SHIP\s*FROM|RETURN)\s*:?", re.IGNORECASE)
-    ship_to_pattern = re.compile(r"^(SHIP\s*TO|DELIVER\s*TO)\s*:?", re.IGNORECASE)
+    ship_to_pattern = re.compile(r"^(SHIP\s*TO|DELIVER\s*TO|TO:?)\s*$", re.IGNORECASE)
 
     from_idx    = next((i for i, l in enumerate(lines) if from_pattern.match(l)),    None)
     ship_to_idx = next((i for i, l in enumerate(lines) if ship_to_pattern.match(l)), None)

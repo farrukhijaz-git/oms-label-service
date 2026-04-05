@@ -8,7 +8,7 @@ from typing import List
 from app.middleware.auth import get_current_user, require_admin
 from app.services.pdf_extractor import extract_label_data, split_pdf_pages
 from app.services.fuzzy_matcher import find_best_match
-from app.services.storage import upload_pdf, get_signed_url
+from app.services.storage import upload_pdf, get_signed_url, delete_pdf
 from datetime import datetime, timezone
 
 router = APIRouter()
@@ -390,3 +390,28 @@ async def download_label(label_id: str, request: Request):
     except Exception as e:
         print(f"Error generating signed URL: {e}")
         raise HTTPException(status_code=500, detail="Could not generate download URL")
+
+
+# ---------------------------------------------------------------------------
+# DELETE /labels/{label_id} — delete label record and its file from storage
+# ---------------------------------------------------------------------------
+@router.delete("/{label_id}")
+async def delete_label(label_id: str, request: Request):
+    get_current_user(request)
+    db = request.app.state.db
+
+    row = await db.fetchrow(
+        "DELETE FROM labels.shipping_labels WHERE id = $1 RETURNING storage_path",
+        label_id,
+    )
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Label not found")
+
+    try:
+        await asyncio.to_thread(delete_pdf, row["storage_path"])
+    except Exception as e:
+        # File deletion failure is non-fatal — the DB row is already gone
+        print(f"Warning: could not delete storage file {row['storage_path']}: {e}")
+
+    return {"ok": True, "label_id": label_id}
