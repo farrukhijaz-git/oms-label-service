@@ -20,7 +20,7 @@ async def get_open_orders(orders_service_url: str, user_id: str) -> list:
         try:
             resp = await client.get(
                 f"{orders_service_url}/orders",
-                params={"status": "new,label_generated,inventory_ordered,packed,ready,shipped,delivered", "limit": 200},
+                params={"status": "new,label_generated,inventory_ordered,packed,ready,shipped,delivered,cancelled", "limit": 200},
                 headers={"X-User-Id": user_id, "X-User-Role": "staff"},
                 timeout=10.0
             )
