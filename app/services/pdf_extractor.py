@@ -79,6 +79,34 @@ _USPS_TRACKING_RE = re.compile(r"\b(9[0-9]{21,34}|[A-Z]{2}[0-9]{9}US|420[0-9]{5}
 _UPS_TRACKING_RE  = re.compile(r"\b(1Z[A-Z0-9]{16})\b")
 _FEDEX_TRACKING_RE = re.compile(r"\b([0-9]{12}|[0-9]{15}|[0-9]{20})\b")
 
+# Tracking section delimiter (marks end of recipient area on the label)
+_TRACKING_SECTION_RE = re.compile(r'(?:USPS\s+)?TRACKING\s*#', re.IGNORECASE)
+
+
+def _is_tracking_number_line(line: str) -> bool:
+    """
+    Return True if the line looks like a tracking/barcode number.
+
+    More robust than a single regex — handles OCR artifacts (trailing
+    punctuation, partial characters) and various spacing formats.
+    """
+    cleaned = line.strip()
+    if not cleaned:
+        return False
+    # Exact match: starts with digit, rest is digits+spaces, 15+ chars
+    if re.match(r'^\d[\d\s]{14,}$', cleaned):
+        return True
+    # Strip leading/trailing non-alphanumeric (OCR artifacts like .|})
+    stripped = re.sub(r'^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$', '', cleaned)
+    if stripped and re.match(r'^\d[\d\s]{14,}$', stripped):
+        return True
+    # High digit ratio: 15+ digits and >80% of non-space chars are digits
+    digits = re.sub(r'\D', '', cleaned)
+    non_space = cleaned.replace(' ', '')
+    if len(digits) >= 15 and non_space and len(digits) / len(non_space) > 0.8:
+        return True
+    return False
+
 
 # ── Carrier detection ─────────────────────────────────────────────────────────
 
@@ -227,11 +255,8 @@ def _collect_address(lines: list, start: int) -> str | None:
             continue
         if _SECTION_STOP_RE.match(line):
             break
-        # Skip tracking/barcode number lines — on USPS Priority Mail labels the
-        # barcode number appears directly below the recipient name before the
-        # street address, and starts with digits which fools the street detector.
-        # Pattern: starts with digit, rest is digits+spaces, total 15+ chars.
-        if re.match(r'^\d[\d\s]{14,}$', line):
+        # Skip tracking/barcode number lines
+        if _is_tracking_number_line(line):
             continue
         if re.match(r"^\d+\s", line) and street is None:
             street = line
@@ -247,7 +272,7 @@ def _collect_address(lines: list, start: int) -> str | None:
     # Fall back to first non-empty, non-tracking-number line at start position
     for j in range(start, min(start + 5, len(lines))):
         fb = lines[j].strip()
-        if fb and not re.match(r'^\d[\d\s]{14,}$', fb) and not _SECTION_STOP_RE.match(fb):
+        if fb and not _is_tracking_number_line(fb) and not _SECTION_STOP_RE.match(fb):
             return fb.upper()
     return None
 
@@ -275,6 +300,84 @@ def _clean_name(name: str) -> str | None:
     if lower_words & CARRIER_KEYWORDS:
         return None
     return name or None
+
+
+# ── Anchor-less layout extraction ─────────────────────────────────────────────
+
+def _extract_from_layout(lines: list) -> tuple:
+    """
+    Anchor-less layout extraction for labels without SHIP TO / TO: markers.
+
+    Identifies the sender block by company keywords (LLC, Inc, etc.), then
+    finds the recipient as the next person-name + address block after the
+    sender, stopping before any TRACKING section.
+
+    Designed for Pitney Bowes / USPS Priority Mail labels that lack explicit
+    SHIP TO anchors.
+    """
+    # Find the tracking section boundary
+    content_end = len(lines)
+    for i, line in enumerate(lines):
+        if _TRACKING_SECTION_RE.search(line):
+            content_end = i
+            break
+
+    # Find sender block (line containing company keywords like LLC, Inc)
+    sender_idx = None
+    for i in range(content_end):
+        lower_words = {w.lower().rstrip(".,") for w in lines[i].split()}
+        if lower_words & COMPANY_KEYWORDS:
+            sender_idx = i
+            break
+
+    if sender_idx is None:
+        return None, None
+
+    # Find end of sender address: scan for city/state/zip after sender name
+    sender_end = sender_idx + 1
+    for j in range(sender_idx + 1, min(sender_idx + 4, content_end)):
+        if _CITY_STATE_ZIP_RE.search(lines[j]):
+            sender_end = j + 1
+            break
+
+    # After sender block, find recipient name + address
+    name = None
+    addr_start = None
+    for i in range(sender_end, content_end):
+        line = lines[i].strip()
+        if not line:
+            continue
+        # Skip tracking/barcode number lines
+        if _is_tracking_number_line(line):
+            continue
+        # Skip short alphanumeric codes (0003, R056, C000)
+        if re.match(r'^[A-Z0-9]{2,6}$', line):
+            continue
+        # Skip purely numeric or mostly-numeric lines
+        if re.match(r'^[\d\s\-]+$', line):
+            continue
+        # Skip carrier keywords
+        lower_words = {w.lower().rstrip(".,") for w in line.split()}
+        if lower_words & CARRIER_KEYWORDS:
+            continue
+        # Skip other company lines
+        if lower_words & COMPANY_KEYWORDS:
+            continue
+        # Must look like a name: 2+ words, no digits
+        candidate = _clean_name(line)
+        if candidate and not re.search(r'\d', candidate):
+            words = candidate.split()
+            if len(words) >= 2:
+                name = candidate
+                addr_start = i + 1
+                break
+
+    if not name or addr_start is None:
+        return None, None
+
+    # Collect address between recipient name and tracking section
+    address = _collect_address(lines[:content_end], addr_start)
+    return name, address
 
 
 # ── Generic fallback extraction ───────────────────────────────────────────────
@@ -368,8 +471,8 @@ def _extract_address(lines: list) -> str | None:
         lower_words = {w.lower().rstrip(".,") for w in line.split()}
         if lower_words & CARRIER_KEYWORDS:
             continue
-        # Skip tracking/barcode number lines (15+ digit sequences, possibly space-formatted)
-        if re.match(r'^\d[\d\s]{14,}$', line.strip()):
+        # Skip tracking/barcode number lines
+        if _is_tracking_number_line(line):
             continue
         if not street_pattern.match(line):
             continue
@@ -508,12 +611,21 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
         # ── USPS ──────────────────────────────────────────────────────────────
         # Labels are typically single-column; anchored extraction handles all
         # USPS format variants (SHIP TO:, TO:, DELIVER TO:, two-column Ground
-        # Advantage).  OCR supplement fires when pdfplumber finds partial text
-        # but no recipient — covers Ground Advantage and some Priority Mail
-        # variants where the SHIP TO block uses a non-standard embedded font.
+        # Advantage).  Layout extraction handles anchor-less labels (Pitney
+        # Bowes, CommPrice USPS Priority Mail).  OCR supplement fires when
+        # pdfplumber finds partial text but no recipient.
         name, address = _extract_ship_to(lines)
         if name or address:
             logger.info(f"USPS full-page → name={name!r}, address={address!r}")
+
+        # Anchor-less layout extraction (Pitney Bowes / Priority Mail without
+        # SHIP TO markers)
+        if not (name and address):
+            layout_name, layout_address = _extract_from_layout(lines)
+            if layout_name or layout_address:
+                name = name or layout_name
+                address = address or layout_address
+                logger.info(f"USPS layout → name={name!r}, address={address!r}")
 
         if not name and not result["is_image_pdf"] and all_text.strip():
             logger.info("USPS: no recipient found — running OCR supplement")
@@ -523,16 +635,29 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
                 ocr_name, ocr_address = _extract_ship_to(ocr_lines)
                 if ocr_name or ocr_address:
                     name, address = ocr_name, ocr_address
-                    lines = ocr_lines   # richer text for tracking extraction
+                    lines = ocr_lines
                     logger.info(f"USPS OCR supplement → name={name!r}, address={address!r}")
                 else:
-                    lines = ocr_lines
-                    logger.info("USPS OCR supplement: no SHIP TO, using OCR lines for heuristics")
+                    # Try layout extraction on OCR text
+                    ocr_name, ocr_address = _extract_from_layout(ocr_lines)
+                    if ocr_name or ocr_address:
+                        name = name or ocr_name
+                        address = address or ocr_address
+                        lines = ocr_lines
+                        logger.info(f"USPS OCR layout → name={name!r}, address={address!r}")
+                    else:
+                        lines = ocr_lines
+                        logger.info("USPS OCR: no match, using OCR lines for heuristics")
 
     else:
         # ── Unknown carrier: full waterfall ───────────────────────────────────
         name, address = _extract_ship_to(lines)
-
+        if not (name and address):
+            layout_name, layout_address = _extract_from_layout(lines)
+            if layout_name or layout_address:
+                name = name or layout_name
+                address = address or layout_address
+                logger.info(f"Unknown layout → name={name!r}, address={address!r}")
         if not (name or address) and not result["is_image_pdf"]:
             right_text = _extract_text_right_half(pdf_bytes)
             if right_text.strip():
@@ -552,7 +677,14 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
                     lines = ocr_lines
                     logger.info(f"Unknown OCR supplement → name={name!r}, address={address!r}")
                 else:
-                    lines = ocr_lines
+                    ocr_name, ocr_address = _extract_from_layout(ocr_lines)
+                    if ocr_name or ocr_address:
+                        name = name or ocr_name
+                        address = address or ocr_address
+                        lines = ocr_lines
+                        logger.info(f"Unknown OCR layout → name={name!r}, address={address!r}")
+                    else:
+                        lines = ocr_lines
 
     if name or address:
         logger.info(f"Anchored extraction result → name={name!r}, address={address!r}")
@@ -563,6 +695,16 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
         logger.info("No anchored result — using generic heuristics")
         result["customer_name"] = _extract_name(lines)
         result["address"] = _extract_address(lines)
+
+    # Validate address is not actually a tracking number
+    if result["address"] and _is_tracking_number_line(result["address"].replace(', ', ' ')):
+        logger.info(f"Rejecting tracking-number-like address: {result['address']!r}")
+        result["address"] = None
+        # Try to recover address via layout extraction
+        _, layout_addr = _extract_from_layout(lines)
+        if layout_addr:
+            result["address"] = layout_addr
+            logger.info(f"Recovered address via layout: {layout_addr!r}")
 
     # Step 5: tracking number extraction (always use richest line set available)
     result["tracking_number"] = _extract_tracking_number(lines)
