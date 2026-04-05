@@ -198,6 +198,11 @@ def _collect_address(lines: list, start: int) -> str | None:
             continue
         if _SECTION_STOP_RE.match(line):
             break
+        # Skip tracking/barcode number lines — on USPS Priority Mail labels the
+        # barcode number appears directly below the recipient name before the
+        # street address, and starts with digits which fools the street detector.
+        if re.match(r'^\d[\d\s]{14,}$', line):
+            continue
         if re.match(r"^\d+\s", line) and street is None:
             street = line
         if _CITY_STATE_ZIP_RE.search(line) and city_zip is None:
@@ -209,8 +214,12 @@ def _collect_address(lines: list, start: int) -> str | None:
         return f"{street}, {city_zip}".upper()
     if street:
         return street.upper()
-    # Fall back to first non-empty line at start position
-    return lines[start].strip().upper() if start < len(lines) else None
+    # Fall back to first non-empty line at start position that isn't a tracking number
+    for j in range(start, min(start + 5, len(lines))):
+        fb = lines[j].strip()
+        if fb and not re.match(r'^\d[\d\s]{14,}$', fb):
+            return fb.upper()
+    return None
 
 
 def _build_address(line1: str, line2: str) -> str | None:
@@ -331,6 +340,9 @@ def _extract_address(lines: list) -> str | None:
     for i, line in enumerate(lines):
         lower_words = {w.lower().rstrip(".,") for w in line.split()}
         if lower_words & CARRIER_KEYWORDS:
+            continue
+        # Skip tracking/barcode number lines (15+ digit sequences, possibly space-formatted)
+        if re.match(r'^\d[\d\s]{14,}$', line.strip()):
             continue
         if not street_pattern.match(line):
             continue

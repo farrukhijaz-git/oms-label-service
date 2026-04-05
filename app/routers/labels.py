@@ -111,6 +111,7 @@ async def _process_upload_job(
                         "extracted_address": extracted.get("address"),
                         "tracking_number": extracted.get("tracking_number"),
                         "is_image_pdf": extracted["is_image_pdf"],
+                        "raw_text_preview": extracted.get("raw_text", "")[:500],
                         "match_status": row["match_status"],
                         "match_confidence": float(row["match_confidence"]) if row["match_confidence"] else 0.0,
                         "matched_order_id": str(row["order_id"]) if row["order_id"] else None,
