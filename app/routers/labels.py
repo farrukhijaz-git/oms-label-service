@@ -204,15 +204,18 @@ async def get_queue(request: Request):
         SELECT
           l.id, l.original_filename, l.extracted_name, l.extracted_address,
           l.tracking_number, l.match_confidence, l.match_status, l.order_id, l.uploaded_at,
-          o.customer_name   AS matched_customer_name,
-          o.external_id     AS matched_order_external_id,
-          o.address_line1   AS matched_address_line1,
-          o.address_line2   AS matched_address_line2,
-          o.city            AS matched_city,
-          o.state           AS matched_state,
-          o.zip             AS matched_zip,
-          o.status          AS matched_order_status,
-          o.tracking_number AS order_tracking_number
+          o.customer_name             AS matched_customer_name,
+          o.external_id               AS matched_order_external_id,
+          o.address_line1             AS matched_address_line1,
+          o.address_line2             AS matched_address_line2,
+          o.city                      AS matched_city,
+          o.state                     AS matched_state,
+          o.zip                       AS matched_zip,
+          o.status                    AS matched_order_status,
+          o.tracking_number           AS order_tracking_number,
+          o.platform                  AS matched_platform,
+          o.walmart_status            AS matched_walmart_status,
+          o.tracking_pushed_to_walmart AS matched_tracking_pushed_to_walmart
         FROM labels.shipping_labels l
         LEFT JOIN orders.orders o ON l.order_id = o.id
         WHERE l.match_status IN ('pending', 'tracking_conflict')
