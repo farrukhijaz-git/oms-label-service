@@ -429,11 +429,16 @@ def _extract_tracking_number(lines: list) -> str | None:
     for line in lines:
         candidates = [line]
         collapsed = re.sub(r"\s+", "", line)
-        if collapsed != line and (
-            re.match(r"^\d{15,}$", collapsed)                       # USPS/FedEx digit-only
-            or re.match(r"^1Z[A-Z0-9]{16}$", collapsed, re.IGNORECASE)  # UPS formatted
-        ):
+        if collapsed != line and re.match(r"^\d{15,}$", collapsed):  # USPS/FedEx digit-only
             candidates.append(collapsed)
+
+        # UPS: extract 1Z + next 16 alphanumeric chars, ignoring spaces/punctuation.
+        # Handles both standalone "1Z 188 22H 03 ..." and embedded "TRACKING #: 1Z 188 22H 03 ..."
+        ups_start = re.search(r'1Z', line, re.IGNORECASE)
+        if ups_start:
+            alnum = re.sub(r'[^A-Z0-9]', '', line[ups_start.end():].upper())
+            if len(alnum) >= 16:
+                candidates.append('1Z' + alnum[:16])
 
         for candidate in candidates:
             # USPS — most specific first to avoid false-positives
