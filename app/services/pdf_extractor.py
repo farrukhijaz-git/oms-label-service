@@ -429,7 +429,10 @@ def _extract_tracking_number(lines: list) -> str | None:
     for line in lines:
         candidates = [line]
         collapsed = re.sub(r"\s+", "", line)
-        if collapsed != line and re.match(r"^\d{15,}$", collapsed):
+        if collapsed != line and (
+            re.match(r"^\d{15,}$", collapsed)                       # USPS/FedEx digit-only
+            or re.match(r"^1Z[A-Z0-9]{16}$", collapsed, re.IGNORECASE)  # UPS formatted
+        ):
             candidates.append(collapsed)
 
         for candidate in candidates:
