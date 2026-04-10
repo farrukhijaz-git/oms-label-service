@@ -635,6 +635,7 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
             ocr_text = _ocr_pdf_page(pdf_bytes)
             if ocr_text.strip():
                 ocr_lines = [l.strip() for l in ocr_text.split("\n") if l.strip()]
+                logger.info(f"OCR LINES: {ocr_lines[:50]}")
                 ocr_name, ocr_address = _extract_ship_to(ocr_lines)
                 if ocr_name or ocr_address:
                     name, address = ocr_name, ocr_address
@@ -674,6 +675,7 @@ def extract_label_data(pdf_bytes: bytes) -> dict:
             ocr_text = _ocr_pdf_page(pdf_bytes)
             if ocr_text.strip():
                 ocr_lines = [l.strip() for l in ocr_text.split("\n") if l.strip()]
+                logger.info(f"OCR LINES: {ocr_lines[:50]}")
                 ocr_name, ocr_address = _extract_ship_to(ocr_lines)
                 if ocr_name or ocr_address:
                     name, address = ocr_name, ocr_address
