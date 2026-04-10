@@ -13,6 +13,21 @@ from datetime import datetime, timezone
 
 router = APIRouter()
 
+# Shared secret for service-to-service calls through the gateway.
+# The gateway validates this header and bypasses JWT when it matches.
+_INTERNAL_SECRET = os.environ.get("INTERNAL_SERVICE_SECRET", "")
+
+
+def _service_headers(user_id: str, user_role: str = "staff") -> dict:
+    """Build headers for internal calls to the orders service via the gateway."""
+    headers = {
+        "X-User-Id": user_id,
+        "X-User-Role": user_role,
+    }
+    if _INTERNAL_SECRET:
+        headers["X-Internal-Secret"] = _INTERNAL_SECRET
+    return headers
+
 
 async def get_open_orders(orders_service_url: str, user_id: str) -> list:
     """Fetch open orders from the orders service for matching."""
@@ -21,7 +36,7 @@ async def get_open_orders(orders_service_url: str, user_id: str) -> list:
             resp = await client.get(
                 f"{orders_service_url}/orders",
                 params={"status": "new,label_generated,inventory_ordered,packed,ready,shipped,delivered,cancelled", "limit": 200},
-                headers={"X-User-Id": user_id, "X-User-Role": "staff"},
+                headers=_service_headers(user_id),
                 timeout=10.0
             )
             if resp.status_code == 200:
@@ -143,7 +158,7 @@ async def upload_labels(
     user = get_current_user(request)
     db = request.app.state.db
     jobs_store = request.app.state.upload_jobs
-    orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3002")
+    orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3001")
 
     # Read all file bytes NOW (before request connection closes)
     files_data = []
@@ -255,7 +270,7 @@ async def _sync_order_after_confirm(orders_service_url: str, order_id: str, labe
     Only sets label_id on the order if no primary label is already attached (multi-label support).
     Only advances status to label_generated if current status is 'new'.
     """
-    headers = {"X-User-Id": user_id, "X-User-Role": user_role or "staff"}
+    headers = _service_headers(user_id, user_role or "staff")
     try:
         async with httpx.AsyncClient() as client:
             existing_tracking = None
@@ -307,7 +322,7 @@ async def confirm_label(label_id: str, request: Request, background_tasks: Backg
     if not order_id:
         raise HTTPException(status_code=400, detail="order_id is required")
 
-    orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3002")
+    orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3001")
 
     async with db.acquire() as conn:
         label = await conn.fetchrow(
@@ -340,7 +355,7 @@ async def _sync_order_after_assign(orders_service_url: str, order_id: str, label
     """Background task: update order with label_id and tracking after manual assign.
     Only sets label_id on the order if no primary label is already attached (multi-label support).
     """
-    headers = {"X-User-Id": user_id, "X-User-Role": user_role or "staff"}
+    headers = _service_headers(user_id, user_role or "staff")
     try:
         async with httpx.AsyncClient() as client:
             existing_tracking = None
@@ -370,7 +385,7 @@ async def _sync_order_after_assign(orders_service_url: str, order_id: str, label
 async def assign_label(label_id: str, request: Request, background_tasks: BackgroundTasks):
     user = get_current_user(request)
     db = request.app.state.db
-    orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3002")
+    orders_service_url = os.environ.get("ORDERS_SERVICE_URL", "http://localhost:3001")
 
     body = await request.json()
     order_id = body.get("order_id")
